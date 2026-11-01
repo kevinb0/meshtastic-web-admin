@@ -15,7 +15,7 @@ A Python web dashboard for pairing to a Wi-Fi–connected Meshtastic **Admin Nod
 - **Signal Quality:** Live `SNR` (dB), `RSSI` (dBm), and 4-bar RF link indicator per node.
 - **Battery & Power:** Battery `%` progress bar, external USB power badge, voltage (`V`), and channel utilization (`%`).
 - **Last Message & Packet Activity:** Per-node latest text message preview, slide-out mesh text chat drawer (with broadcast & direct messaging), last heard packet type (`TEXT`, `POSITION`, `TELEMETRY`, `NODEINFO`, `ADMIN`, `TRACEROUTE`), and live relative `lastHeard` timestamps.
-- **Instant Filtering:** Filter the mesh view by **All Nodes**, **Admin Controllable**, **Direct RF**, or **Relayed (1+ Hops)**, plus search by node name, short name, hardware model, or `!hex` ID.
+- **Instant Filtering & Sorting:** Filter the mesh view by **All Nodes**, **Admin Controllable**, **Direct RF**, or **Relayed (1+ Hops)**, sort ascending/descending by **Battery** (`Low→High` to immediately spot low batteries, or `High→Low`) or **Name** (`A→Z` / `Z→A` with natural numeric ordering), and search by node name, short name, hardware model, or `!hex` ID.
 
 ### 3. Multi-Hop Relay Topology & Live Traceroute
 - Distinguishes **Direct RF (`0` hops)**, **Relayed (`1+` hops)**, and **Via MQTT** links.

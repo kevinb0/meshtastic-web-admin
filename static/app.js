@@ -6,6 +6,8 @@
     snapshot: null,
     filter: "all",
     search: "",
+    sortBy: "default", // 'default' | 'battery' | 'name'
+    sortDir: "asc", // 'asc' | 'desc'
     pollTimer: null,
     modal: {
       open: false,
@@ -42,6 +44,10 @@
     kpiAdmin: document.getElementById("kpi-admin"),
     kpiDirect: document.getElementById("kpi-direct"),
     kpiRelayed: document.getElementById("kpi-relayed"),
+    nodeSortBy: document.getElementById("node-sort-by"),
+    nodeSortDir: document.getElementById("node-sort-dir"),
+    thSortName: document.getElementById("th-sort-name"),
+    thSortBattery: document.getElementById("th-sort-battery"),
     nodeSearch: document.getElementById("node-search"),
     probeStatusBar: document.getElementById("probe-status-bar"),
     nodesTbody: document.getElementById("nodes-tbody"),
@@ -241,7 +247,54 @@
     renderMessagesPanel(snap.messages || [], snap.nodes || [], now);
   }
 
+  function getBatterySortInfo(node) {
+    const b = node.battery || {};
+    if (b.is_powered) {
+      return { known: true, val: 101, voltage: Number(b.voltage ?? 999) };
+    }
+    if (b.level !== null && b.level !== undefined) {
+      return { known: true, val: Number(b.level), voltage: Number(b.voltage ?? 0) };
+    }
+    return { known: false, val: null, voltage: 0 };
+  }
+
+  function compareNodeNames(a, b) {
+    const na = String(a.long_name || a.short_name || a.node_id || "");
+    const nb = String(b.long_name || b.short_name || b.node_id || "");
+    const cmp = na.localeCompare(nb, undefined, { numeric: true, sensitivity: "base" });
+    return cmp !== 0 ? cmp : String(a.node_id || "").localeCompare(String(b.node_id || ""));
+  }
+
+  function syncSortControlsUI() {
+    if (el.nodeSortBy) el.nodeSortBy.value = state.sortBy;
+    if (el.nodeSortDir) {
+      const isDefault = state.sortBy === "default";
+      el.nodeSortDir.disabled = isDefault;
+      if (isDefault) {
+        el.nodeSortDir.innerHTML = "&#8593; Asc";
+      } else if (state.sortBy === "battery") {
+        el.nodeSortDir.innerHTML =
+          state.sortDir === "asc" ? "&#8593; Low&rarr;High" : "&#8595; High&rarr;Low";
+      } else {
+        el.nodeSortDir.innerHTML =
+          state.sortDir === "asc" ? "&#8593; A&rarr;Z" : "&#8595; Z&rarr;A";
+      }
+    }
+    document.querySelectorAll(".nodes-table th.sortable-th").forEach((th) => {
+      th.classList.toggle("active-sort", th.dataset.sort === state.sortBy);
+    });
+    if (el.thSortName) {
+      el.thSortName.textContent =
+        state.sortBy === "name" ? (state.sortDir === "asc" ? "▲" : "▼") : "";
+    }
+    if (el.thSortBattery) {
+      el.thSortBattery.textContent =
+        state.sortBy === "battery" ? (state.sortDir === "asc" ? "▲" : "▼") : "";
+    }
+  }
+
   function renderNodesTable(nodes, nowSec) {
+    syncSortControlsUI();
     const q = state.search.trim().toLowerCase();
     const filtered = nodes.filter((n) => {
       if (state.filter === "admin" && !n.has_admin) return false;
@@ -252,6 +305,27 @@
       const hay = `${n.long_name} ${n.short_name} ${n.node_id} ${n.hw_model} ${n.role} ${viaName}`.toLowerCase();
       return hay.includes(q);
     });
+
+    if (state.sortBy !== "default") {
+      const dir = state.sortDir === "desc" ? -1 : 1;
+      filtered.sort((a, b) => {
+        if (state.sortBy === "battery") {
+          const ba = getBatterySortInfo(a);
+          const bb = getBatterySortInfo(b);
+          // Keep unknown battery readings at the bottom regardless of asc/desc
+          if (ba.known !== bb.known) return ba.known ? -1 : 1;
+          if (ba.known && bb.known) {
+            if (ba.val !== bb.val) return (ba.val - bb.val) * dir;
+            if (ba.voltage !== bb.voltage) return (ba.voltage - bb.voltage) * dir;
+          }
+          return compareNodeNames(a, b);
+        }
+        if (state.sortBy === "name") {
+          return compareNodeNames(a, b) * dir;
+        }
+        return 0;
+      });
+    }
 
     if (filtered.length === 0) {
       el.nodesTbody.innerHTML = `
@@ -1252,6 +1326,40 @@
   el.nodeSearch.addEventListener("input", () => {
     state.search = el.nodeSearch.value;
     if (state.snapshot) renderSnapshot(state.snapshot);
+  });
+
+  if (el.nodeSortBy) {
+    el.nodeSortBy.addEventListener("change", () => {
+      state.sortBy = el.nodeSortBy.value;
+      // Default to ascending (Lowest Battery first / A->Z first) when choosing a field
+      state.sortDir = "asc";
+      syncSortControlsUI();
+      if (state.snapshot) renderSnapshot(state.snapshot);
+    });
+  }
+
+  if (el.nodeSortDir) {
+    el.nodeSortDir.addEventListener("click", () => {
+      if (state.sortBy === "default") return;
+      state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+      syncSortControlsUI();
+      if (state.snapshot) renderSnapshot(state.snapshot);
+    });
+  }
+
+  document.querySelectorAll(".nodes-table th.sortable-th").forEach((th) => {
+    th.addEventListener("click", () => {
+      const targetSort = th.dataset.sort;
+      if (!targetSort) return;
+      if (state.sortBy === targetSort) {
+        state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+      } else {
+        state.sortBy = targetSort;
+        state.sortDir = "asc";
+      }
+      syncSortControlsUI();
+      if (state.snapshot) renderSnapshot(state.snapshot);
+    });
   });
 
   // Delegated clicks inside Nodes Table

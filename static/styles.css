@@ -477,6 +477,67 @@ code, .mono-id {
   font-size: 0.85rem;
 }
 
+.sort-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 3px 6px 3px 10px;
+}
+
+.sort-label {
+  font-size: 0.74rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.sort-select {
+  background: transparent;
+  border: none;
+  color: var(--text-main);
+  font-size: 0.84rem;
+  font-weight: 600;
+  padding: 4px 6px;
+  cursor: pointer;
+  outline: none;
+}
+
+.sort-select option {
+  background: var(--bg-card);
+  color: var(--text-main);
+}
+
+.sort-dir-btn {
+  padding: 4px 9px;
+  font-size: 0.78rem;
+  min-width: 72px;
+}
+
+.nodes-table th.sortable-th {
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.14s ease, background 0.14s ease;
+}
+
+.nodes-table th.sortable-th:hover {
+  color: var(--text-main);
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.nodes-table th.sortable-th.active-sort {
+  color: var(--accent);
+}
+
+.th-sort-ind {
+  display: inline-block;
+  margin-left: 3px;
+  font-size: 0.78rem;
+}
+
 .probe-status-bar {
   margin-top: 10px;
   padding: 8px 13px;

@@ -142,6 +142,23 @@
               <span class="legend-dot slate"></span> Standard Node (view only)
             </span>
           </div>
+          <div class="sort-controls" role="group" aria-label="Sort nodes">
+            <label for="node-sort-by" class="sort-label">Sort</label>
+            <select id="node-sort-by" class="sort-select" title="Sort node list by field">
+              <option value="default">Default</option>
+              <option value="battery">Battery</option>
+              <option value="name">Name</option>
+            </select>
+            <button
+              id="node-sort-dir"
+              type="button"
+              class="btn btn-secondary btn-sm sort-dir-btn"
+              title="Toggle ascending or descending order"
+              disabled
+            >
+              &#8593; Asc
+            </button>
+          </div>
           <input
             id="node-search"
             class="search-input"
@@ -160,10 +177,14 @@
             <thead>
               <tr>
                 <th class="col-icon">Access</th>
-                <th>Node</th>
+                <th class="sortable-th" data-sort="name" title="Click to sort by node name">
+                  Node <span id="th-sort-name" class="th-sort-ind"></span>
+                </th>
                 <th>Routing / Relay Info</th>
                 <th>Signal Strength</th>
-                <th>Battery &amp; Power</th>
+                <th class="sortable-th" data-sort="battery" title="Click to sort by battery level">
+                  Battery &amp; Power <span id="th-sort-battery" class="th-sort-ind"></span>
+                </th>
                 <th>Last Message &amp; Activity</th>
                 <th class="col-actions">Tools</th>
               </tr>
