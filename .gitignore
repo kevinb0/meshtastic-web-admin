@@ -1,0 +1,23 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python bytecode & test caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local runtime state & caches
+admin_cache.json
+*.log
+
+# Environment & OS files
+.env
+.env.*
+.DS_Store
+Thumbs.db

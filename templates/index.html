@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Meshtastic Web Admin</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Header & HTTP Pairing Bar -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M2 16l5-8 5 8 5-10 5 10" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div>
+          <h1>Meshtastic Web Admin</h1>
+          <p class="subtitle">HTTP Admin Node Console &middot; Mesh Status, Relay Topology &amp; Remote Configuration</p>
+        </div>
+      </div>
+
+      <form id="pair-form" class="pair-controls">
+        <label for="target-input" class="sr-only">Admin Node HTTP Address</label>
+        <div class="input-with-tag">
+          <span class="input-tag">ADMIN NODE</span>
+          <input
+            id="target-input"
+            type="text"
+            value="http://meshtastic.local"
+            placeholder="http://meshtastic.local or http://192.168.1.50"
+            autocomplete="off"
+          />
+        </div>
+        <button id="pair-btn" type="submit" class="btn btn-primary">Pair via HTTP</button>
+        <button id="disconnect-btn" type="button" class="btn btn-ghost hidden">Disconnect</button>
+        <span id="conn-badge" class="status-pill disconnected">Not Paired</span>
+      </form>
+    </header>
+
+    <!-- Helpful single-consumer HTTP hint / error banner -->
+    <div id="alert-banner" class="alert-banner hidden"></div>
+
+    <!-- Paired Admin Node Hero Summary -->
+    <section id="admin-node-card" class="admin-hero hidden">
+      <div class="admin-hero-main">
+        <button id="configure-local-btn" class="node-icon-btn admin-power large" title="Admin Node — Click to Configure All Parameters">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.9">
+            <path d="M12 2l7 3v6c0 5-3.2 9.4-7 11-3.8-1.6-7-6-7-11V5l7-3z"/>
+            <circle cx="10.5" cy="11" r="2.2"/>
+            <path d="M12.3 11H16v2.2M14.3 11v1.8" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <div class="admin-hero-text">
+          <div class="admin-hero-title-row">
+            <span class="eyebrow-badge">PAIRED ADMIN NODE</span>
+            <h2 id="admin-name">&mdash;</h2>
+            <span id="admin-short" class="short-pill">&mdash;</span>
+            <code id="admin-id" class="mono-id">!00000000</code>
+          </div>
+          <div id="admin-meta" class="admin-meta-row"></div>
+        </div>
+      </div>
+
+      <div class="admin-hero-actions">
+        <button id="open-usb-enroll-btn" type="button" class="btn btn-primary btn-sm" title="Plug a radio into USB and write this Admin Node's public key into its security.admin_key slots">
+          Enroll USB Node
+        </button>
+        <button id="copy-pubkey-btn" type="button" class="btn btn-secondary btn-sm" title="Copy Admin Node PKC Public Key for pasting into remote nodes">
+          Copy Admin Public Key
+        </button>
+        <button id="probe-all-btn" type="button" class="btn btn-secondary btn-sm" title="Politely verify which visible mesh nodes grant remote admin power to this Admin Node">
+          Probe Admin Access
+        </button>
+        <button id="toggle-messages-btn" type="button" class="btn btn-secondary btn-sm">
+          Mesh Messages (<span id="msg-count-badge">0</span>)
+        </button>
+      </div>
+    </section>
+
+    <!-- Empty Unpaired Welcome Card -->
+    <section id="unpaired-empty" class="empty-hero">
+      <div class="empty-hero-icon">
+        <svg viewBox="0 0 24 24" width="38" height="38" fill="none" stroke="currentColor" stroke-width="1.6">
+          <path d="M12 2l7 3v6c0 5-3.2 9.4-7 11-3.8-1.6-7-6-7-11V5l7-3z"/>
+          <path d="M9 12l2 2 4-4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <h2>Pair to Your Meshtastic Admin Node</h2>
+      <p>
+        Enter your node's HTTP address above (default <code>http://meshtastic.local</code> or its LAN IP) and click
+        <strong>Pair via HTTP</strong>.
+      </p>
+      <p class="hint-note">
+        <strong>Tip:</strong> Close any open <code>meshtastic.local</code> browser tab while paired so both tabs don't compete for the radio's HTTP packet queue.
+      </p>
+    </section>
+
+    <!-- Main Dashboard Content -->
+    <main id="dashboard-main" class="dashboard-main hidden">
+      <!-- KPI Strip -->
+      <section class="kpi-grid">
+        <div class="kpi-card">
+          <span class="kpi-label">Visible Nodes</span>
+          <strong id="kpi-total" class="kpi-value">0</strong>
+          <span class="kpi-sub">Admin node + heard mesh peers</span>
+        </div>
+        <div class="kpi-card highlight-gold">
+          <span class="kpi-label">Admin Power</span>
+          <strong id="kpi-admin" class="kpi-value">0</strong>
+          <span class="kpi-sub">Click gold shield icon to configure</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-label">Direct RF (0 Hops)</span>
+          <strong id="kpi-direct" class="kpi-value">0</strong>
+          <span class="kpi-sub">Single-hop neighbors</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-label">Relayed (1+ Hops)</span>
+          <strong id="kpi-relayed" class="kpi-value">0</strong>
+          <span class="kpi-sub">Multi-hop routed via relay nodes</span>
+        </div>
+      </section>
+
+      <!-- Legend + Filter Bar -->
+      <section class="toolbar">
+        <div class="filter-pills" role="tablist" aria-label="Node filters">
+          <button class="pill active" data-filter="all" type="button">All Nodes</button>
+          <button class="pill" data-filter="admin" type="button">Admin Power</button>
+          <button class="pill" data-filter="direct" type="button">Direct (0 Hops)</button>
+          <button class="pill" data-filter="relayed" type="button">Relayed (1+ Hops)</button>
+        </div>
+
+        <div class="toolbar-right">
+          <div class="icon-legend">
+            <span class="legend-item">
+              <span class="legend-dot gold"></span> Admin Power (click icon to configure)
+            </span>
+            <span class="legend-item">
+              <span class="legend-dot slate"></span> Standard Node (view only)
+            </span>
+          </div>
+          <input
+            id="node-search"
+            class="search-input"
+            type="search"
+            placeholder="Search name, !id, hardware, relay..."
+          />
+        </div>
+      </section>
+
+      <div id="probe-status-bar" class="probe-status-bar hidden"></div>
+
+      <!-- Nodes Table -->
+      <section class="table-card">
+        <div class="table-scroll">
+          <table class="nodes-table">
+            <thead>
+              <tr>
+                <th class="col-icon">Access</th>
+                <th>Node</th>
+                <th>Routing / Relay Info</th>
+                <th>Signal Strength</th>
+                <th>Battery &amp; Power</th>
+                <th>Last Message &amp; Activity</th>
+                <th class="col-actions">Tools</th>
+              </tr>
+            </thead>
+            <tbody id="nodes-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Collapsible Live Mesh Messages Panel -->
+      <section id="messages-panel" class="messages-panel hidden">
+        <div class="messages-header">
+          <div>
+            <h3>Mesh Text Messages</h3>
+            <p class="muted-sm">Live text messages heard or sent by the paired Admin Node</p>
+          </div>
+          <button id="close-messages-btn" type="button" class="btn btn-ghost btn-sm">Hide</button>
+        </div>
+        <div id="messages-list" class="messages-list"></div>
+        <form id="send-msg-form" class="send-msg-form">
+          <select id="msg-dest-select" title="Destination"></select>
+          <select id="msg-ch-select" title="Channel">
+            <option value="0">Ch 0 (Primary)</option>
+            <option value="1">Ch 1</option>
+            <option value="2">Ch 2</option>
+            <option value="3">Ch 3</option>
+            <option value="4">Ch 4</option>
+            <option value="5">Ch 5</option>
+            <option value="6">Ch 6</option>
+            <option value="7">Ch 7</option>
+          </select>
+          <input id="msg-text-input" type="text" maxlength="200" placeholder="Send a test text message over the mesh..." />
+          <button type="submit" class="btn btn-primary btn-sm">Send</button>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <!-- Full Node Parameter Configuration Modal -->
+  <div id="config-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-node-title">
+    <div class="modal-window">
+      <header class="modal-header">
+        <div class="modal-title-group">
+          <span class="node-icon-btn admin-power static-badge" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2l7 3v6c0 5-3.2 9.4-7 11-3.8-1.6-7-6-7-11V5l7-3z"/>
+              <circle cx="10.5" cy="11" r="2.2"/>
+              <path d="M12.3 11H16v2.2M14.3 11v1.8" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <div>
+            <div class="modal-title-line">
+              <h2 id="modal-node-title">Configure Node</h2>
+              <span id="modal-node-short" class="short-pill"></span>
+              <code id="modal-node-id" class="mono-id"></code>
+            </div>
+            <p id="modal-node-subtitle" class="muted-sm"></p>
+          </div>
+        </div>
+        <button id="modal-close-btn" type="button" class="btn btn-ghost" aria-label="Close configuration modal">&times; Close</button>
+      </header>
+
+      <div class="modal-body">
+        <aside id="modal-nav" class="modal-sidebar"></aside>
+
+        <section class="modal-content-pane">
+          <div class="section-header-bar">
+            <div>
+              <h3 id="section-title">Identity (Owner)</h3>
+              <p id="section-desc" class="muted-sm"></p>
+            </div>
+            <div class="section-header-actions">
+              <button id="reload-section-btn" type="button" class="btn btn-secondary btn-sm">Reload from Node</button>
+              <button id="save-section-btn" type="button" class="btn btn-primary btn-sm">Save Changes</button>
+            </div>
+          </div>
+
+          <div id="section-warning" class="section-warning hidden"></div>
+          <div id="section-status" class="section-status hidden"></div>
+
+          <div id="section-form-container" class="section-form-container"></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- Traceroute Details Popup -->
+  <div id="trace-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-window modal-compact">
+      <header class="modal-header">
+        <h2 id="trace-modal-title">Mesh Traceroute</h2>
+        <button id="trace-close-btn" type="button" class="btn btn-ghost">&times; Close</button>
+      </header>
+      <div id="trace-modal-body" class="trace-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- USB Node Admin Key Enrollment Popup -->
+  <div id="usb-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="usb-modal-title">
+    <div class="modal-window modal-compact" style="width: min(700px, 95vw);">
+      <header class="modal-header">
+        <div class="modal-title-group">
+          <span class="node-icon-btn admin-power static-badge" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2v14m0 0l-3.5-3.5M12 16l3.5-3.5M6 20h12" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <div>
+            <h2 id="usb-modal-title" style="margin:0; font-size:1.08rem;">Enroll USB Node for Remote Admin</h2>
+            <p class="muted-sm">Writes your paired Admin Node's public key over USB using a proper session passkey &amp; 3-slot limit check.</p>
+          </div>
+        </div>
+        <button id="usb-close-btn" type="button" class="btn btn-ghost">&times; Close</button>
+      </header>
+      <div class="trace-modal-body">
+        <div class="field-card">
+          <label class="field-label" for="usb-port-select">1. Select Connected USB Serial Port</label>
+          <div class="array-row" style="flex-wrap:wrap;">
+            <select id="usb-port-select" class="field-select" style="flex:1; min-width:220px;"></select>
+            <button id="usb-refresh-ports-btn" type="button" class="btn btn-secondary btn-sm">Refresh Ports</button>
+            <button id="usb-inspect-btn" type="button" class="btn btn-secondary btn-sm">Inspect USB Node</button>
+          </div>
+        </div>
+
+        <div id="usb-status-banner" class="section-status hidden"></div>
+
+        <div id="usb-node-details" class="field-card hidden" style="margin-top:12px;"></div>
+
+        <div id="usb-enroll-footer" class="hidden" style="margin-top:14px; display:flex; justify-content:flex-end; gap:10px;">
+          <button id="usb-write-key-btn" type="button" class="btn btn-primary">
+            Write Admin Key to USB Node
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
