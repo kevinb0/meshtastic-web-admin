@@ -238,7 +238,11 @@ class FakeMeshtasticRadioState:
         elif variant == "get_module_config_request":
             resp = admin_pb2.AdminMessage()
             resp.session_passkey = REMOTE_PASSKEY
-            resp.get_module_config_response.telemetry.device_update_interval = 900
+            if adm.get_module_config_request == admin_pb2.AdminMessage.ModuleConfigType.MQTT_CONFIG:
+                resp.get_module_config_response.mqtt.address = "mqtt.example.local"
+                resp.get_module_config_response.mqtt.enabled = True
+            else:
+                resp.get_module_config_response.telemetry.device_update_interval = 900
             self._send_admin_reply(dest, mp.id, resp)
 
         elif variant == "get_channel_request":
@@ -536,6 +540,105 @@ class MeshtasticWebAdminTests(unittest.TestCase):
             st = self.client.get("/api/state").get_json()
             far_state = next(n for n in st["nodes"] if n["node_id"] == f"!{FAR_NUM:08x}")
             self.assertTrue(far_state["has_admin"])
+
+    def test_batch_shutdown_and_multi_section_force_push(self) -> None:
+        self.client.post("/api/connect", json={"target": "http://meshtastic.local"})
+        admin_id = f"!{ADMIN_NUM:08x}"
+        relay_id = f"!{RELAY_NUM:08x}"
+        far_id = f"!{FAR_NUM:08x}"
+
+        # 1. Batch Shutdown across [admin_id, relay_id, far_id]:
+        #    Must execute remote peers (relay_id, far_id) BEFORE paired local admin_id!
+        self.radio.received_admin_msgs.clear()
+        batch_act = self.client.post(
+            "/api/batch",
+            json={"node_ids": [admin_id, relay_id, far_id], "action": "shutdown"},
+        ).get_json()
+        self.assertTrue(batch_act["ok"])
+        self.assertEqual(batch_act["total"], 3)
+        self.assertEqual(batch_act["succeeded"], 2)
+        self.assertEqual(batch_act["failed"], 1)
+        result_order = [r["node_id"] for r in batch_act["results"]]
+        self.assertEqual(result_order, [relay_id, far_id, admin_id])
+
+        seen_dests: List[int] = []
+        for dest, _, _ in self.radio.received_admin_msgs:
+            if dest not in seen_dests:
+                seen_dests.append(dest)
+        # Remote peers were contacted BEFORE ADMIN_NUM, and RELAY_NUM received shutdown_seconds before ADMIN_NUM!
+        self.assertEqual(seen_dests, [RELAY_NUM, FAR_NUM, ADMIN_NUM])
+        shutdown_dests = [
+            dest
+            for dest, adm, _ in self.radio.received_admin_msgs
+            if adm.WhichOneof("payload_variant") == "shutdown_seconds"
+        ]
+        self.assertEqual(shutdown_dests, [RELAY_NUM, ADMIN_NUM])
+
+        # 2. Multi-section batch parameter force push (lora.hop_limit + mqtt.enabled + channel 2 shared random256 key)
+        #    in a single begin_edit_settings -> ... -> commit_edit_settings transaction per node!
+        self.radio.received_admin_msgs.clear()
+        changes = [
+            {"kind": "config", "section": "lora", "values": {"hop_limit": 6}},
+            {"kind": "module", "section": "mqtt", "values": {"enabled": False}},
+            {
+                "kind": "channel",
+                "index": 2,
+                "values": {"role": 2, "psk_text": "random256", "settings": {"name": "OpsBatch"}},
+            },
+        ]
+        batch_cfg = self.client.post(
+            "/api/batch",
+            json={"node_ids": [admin_id, relay_id], "changes": changes, "blind_overwrite": False},
+        ).get_json()
+        self.assertTrue(batch_cfg["ok"])
+        self.assertEqual(batch_cfg["succeeded"], 2)
+
+        # Verify RELAY_NUM executed inside ONE edit transaction while preserving lora.region == US & mqtt.address!
+        relay_msgs = [adm for dest, adm, _ in self.radio.received_admin_msgs if dest == RELAY_NUM]
+        relay_variants = [m.WhichOneof("payload_variant") for m in relay_msgs]
+        self.assertEqual(relay_variants.count("begin_edit_settings"), 1)
+        self.assertEqual(relay_variants.count("commit_edit_settings"), 1)
+
+        relay_set_lora = next(
+            m.set_config.lora for m in relay_msgs if m.WhichOneof("payload_variant") == "set_config"
+        )
+        self.assertEqual(relay_set_lora.hop_limit, 6)
+        self.assertEqual(relay_set_lora.region, config_pb2.Config.LoRaConfig.RegionCode.US)
+
+        relay_set_mqtt = next(
+            m.set_module_config.mqtt
+            for m in relay_msgs
+            if m.WhichOneof("payload_variant") == "set_module_config"
+        )
+        self.assertFalse(relay_set_mqtt.enabled)
+        self.assertEqual(relay_set_mqtt.address, "mqtt.example.local")
+
+        # Verify both RELAY_NUM and ADMIN_NUM received the EXACT SAME 32-byte random256 PSK on Channel 2!
+        ch2_psks = [
+            bytes(m.set_channel.settings.psk)
+            for _, m, _ in self.radio.received_admin_msgs
+            if m.WhichOneof("payload_variant") == "set_channel" and m.set_channel.index == 2
+        ]
+        self.assertEqual(len(ch2_psks), 2)
+        self.assertEqual(len(ch2_psks[0]), 32)
+        self.assertEqual(ch2_psks[0], ch2_psks[1])
+
+        # 3. Blind overwrite mode skips reading existing section fields and writes raw values directly
+        self.radio.received_admin_msgs.clear()
+        blind_res = self.client.post(
+            f"/api/node/{relay_id}/batch",
+            json={
+                "changes": [{"kind": "config", "section": "lora", "values": {"hop_limit": 4}}],
+                "blind_overwrite": True,
+            },
+        ).get_json()
+        self.assertTrue(blind_res["ok"])
+        blind_msgs = [adm for dest, adm, _ in self.radio.received_admin_msgs if dest == RELAY_NUM]
+        # No get_config_request needed (session_passkey already fresh, blind_overwrite=True)!
+        self.assertNotIn("get_config_request", [m.WhichOneof("payload_variant") for m in blind_msgs])
+        blind_lora = next(m.set_config.lora for m in blind_msgs if m.WhichOneof("payload_variant") == "set_config")
+        self.assertEqual(blind_lora.hop_limit, 4)
+        self.assertEqual(blind_lora.region, config_pb2.Config.LoRaConfig.RegionCode.UNSET)
 
     def test_global_python_auto_reexec_into_venv(self) -> None:
         proc = subprocess.run(

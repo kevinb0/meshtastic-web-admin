@@ -212,6 +212,45 @@ def create_app(manager: Optional[MeshAdminManager] = None) -> Flask:
         except Exception as exc:
             return _error_response(exc)
 
+    @app.post("/api/node/<path:node_id>/batch")
+    def api_node_batch(node_id: str):
+        body = request.get_json(silent=True) or {}
+        action = str(body.get("action") or "").strip() or None
+        params = body.get("params") if isinstance(body.get("params"), dict) else None
+        changes = body.get("changes") if isinstance(body.get("changes"), list) else None
+        blind_overwrite = bool(body.get("blind_overwrite", False))
+        try:
+            res = mesh.apply_batch_to_node(
+                node_id=node_id,
+                action=action,
+                params=params,
+                changes=changes,
+                blind_overwrite=blind_overwrite,
+            )
+            return jsonify({"ok": True, **res})
+        except Exception as exc:
+            return _error_response(exc)
+
+    @app.post("/api/batch")
+    def api_batch():
+        body = request.get_json(silent=True) or {}
+        node_ids = body.get("node_ids") if isinstance(body.get("node_ids"), list) else []
+        action = str(body.get("action") or "").strip() or None
+        params = body.get("params") if isinstance(body.get("params"), dict) else None
+        changes = body.get("changes") if isinstance(body.get("changes"), list) else None
+        blind_overwrite = bool(body.get("blind_overwrite", False))
+        try:
+            summary = mesh.apply_batch(
+                node_ids=node_ids,
+                action=action,
+                params=params,
+                changes=changes,
+                blind_overwrite=blind_overwrite,
+            )
+            return jsonify({"ok": True, **summary})
+        except Exception as exc:
+            return _error_response(exc)
+
     @app.post("/api/messages/send")
     def api_send_message():
         body = request.get_json(silent=True) or {}

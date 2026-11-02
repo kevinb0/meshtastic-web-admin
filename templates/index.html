@@ -131,6 +131,23 @@
           <button class="pill" data-filter="admin" type="button">Admin Power</button>
           <button class="pill" data-filter="direct" type="button">Direct (0 Hops)</button>
           <button class="pill" data-filter="relayed" type="button">Relayed (1+ Hops)</button>
+          <button
+            id="open-batch-btn"
+            type="button"
+            class="btn btn-primary btn-sm batch-trigger-btn"
+            disabled
+            title="Check one or more nodes below to run batch power actions or force multiple parameters at once"
+          >
+            Edit Selected Nodes (<span id="batch-sel-count">0</span>)
+          </button>
+          <button
+            id="clear-batch-sel-btn"
+            type="button"
+            class="btn btn-ghost btn-sm hidden"
+            title="Clear node selection"
+          >
+            Clear
+          </button>
         </div>
 
         <div class="toolbar-right">
@@ -176,6 +193,14 @@
           <table class="nodes-table">
             <thead>
               <tr>
+                <th class="col-check">
+                  <input
+                    id="select-all-nodes-cb"
+                    type="checkbox"
+                    class="batch-row-cb"
+                    title="Select or deselect visible remote nodes"
+                  />
+                </th>
                 <th class="col-icon">Access</th>
                 <th class="sortable-th" data-sort="name" title="Click to sort by node name">
                   Node <span id="th-sort-name" class="th-sort-ind"></span>
@@ -318,6 +343,80 @@
             Write Admin Key to USB Node
           </button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Batch Multi-Node Actions & Force Parameter Editor Modal -->
+  <div id="batch-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="batch-modal-title">
+    <div class="modal-window">
+      <header class="modal-header">
+        <div class="modal-title-group">
+          <span class="node-icon-btn admin-power static-badge" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="4" width="7" height="7" rx="1.5"/>
+              <rect x="14" y="4" width="7" height="7" rx="1.5"/>
+              <rect x="3" y="13" width="7" height="7" rx="1.5"/>
+              <path d="M14.5 16.5l2 2 4-4" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <div>
+            <div class="modal-title-line">
+              <h2 id="batch-modal-title">Edit Multiple Nodes</h2>
+              <span id="batch-modal-count" class="short-pill">0 selected</span>
+            </div>
+            <p class="muted-sm">
+              Zero pre-read mode: opens immediately without polling nodes. Run a fleet action (e.g. Shutdown All) or check any parameters across sections to force-push them together.
+            </p>
+          </div>
+        </div>
+        <button id="batch-close-btn" type="button" class="btn btn-ghost" aria-label="Close batch modal">&times; Close</button>
+      </header>
+
+      <div id="batch-targets-strip" class="batch-targets-strip"></div>
+
+      <div class="modal-body">
+        <aside id="batch-modal-nav" class="modal-sidebar"></aside>
+
+        <section class="modal-content-pane">
+          <div class="section-header-bar">
+            <div>
+              <h3 id="batch-section-title">Batch Fleet Actions</h3>
+              <p id="batch-section-desc" class="muted-sm"></p>
+            </div>
+            <div id="batch-section-tools" class="section-header-actions hidden">
+              <button id="batch-check-section-btn" type="button" class="btn btn-secondary btn-xs">Check All in Section</button>
+              <button id="batch-clear-section-btn" type="button" class="btn btn-ghost btn-xs">Uncheck Section</button>
+              <button id="batch-clear-all-staged-btn" type="button" class="btn btn-ghost btn-xs">Reset All Staged</button>
+            </div>
+          </div>
+
+          <div id="batch-section-warning" class="section-warning hidden"></div>
+
+          <!-- Live Per-Node Execution Progress Box -->
+          <div id="batch-progress-panel" class="batch-progress-panel hidden">
+            <div class="batch-progress-head">
+              <strong id="batch-progress-title">Pushing to selected nodes...</strong>
+              <button id="batch-cancel-run-btn" type="button" class="btn btn-danger btn-xs hidden">Stop Remaining</button>
+            </div>
+            <div id="batch-progress-list" class="batch-progress-list"></div>
+          </div>
+
+          <div id="batch-form-container" class="section-form-container"></div>
+
+          <footer id="batch-apply-footer" class="batch-apply-footer hidden">
+            <label class="flag-check" title="When checked, sends the raw section protobuf directly without merging existing unchecked fields on each node">
+              <input id="batch-blind-overwrite-cb" type="checkbox" />
+              <span>Overwrite entire section without preserving unchecked fields (blind write)</span>
+            </label>
+            <div style="display:flex; align-items:center; gap:10px;">
+              <span id="batch-staged-summary" class="muted-sm">0 parameters checked</span>
+              <button id="batch-force-apply-btn" type="button" class="btn btn-primary" disabled>
+                Force Apply to Selected Nodes
+              </button>
+            </div>
+          </footer>
+        </section>
       </div>
     </div>
   </div>

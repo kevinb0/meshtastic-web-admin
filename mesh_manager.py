@@ -1702,6 +1702,257 @@ class MeshAdminManager:
             self._send_admin_and_wait(node_num, msg, want_data_response=False, timeout=15.0)
             return {"ok": True, "action": action, "node_id": format_node_id(node_num)}
 
+    # ------------------------------------------------------------------
+    # Batch Fleet Actions & Multi-Section Force Parameter Push
+    # ------------------------------------------------------------------
+    def apply_batch_to_node(
+        self,
+        node_id: str,
+        *,
+        action: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+        changes: Optional[List[Dict[str, Any]]] = None,
+        blind_overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Push either a fleet action (e.g. ``shutdown``, ``reboot``, ``sync_time``) OR a list of
+        multi-section parameter overrides to ``node_id`` inside a single edit transaction."""
+        if action:
+            return self.perform_action(node_id, action, params=params or {})
+
+        items = [c for c in (changes or []) if isinstance(c, dict)]
+        if not items:
+            raise ValueError("No batch action or parameter overrides specified.")
+
+        node_num = self._resolve_node_num(node_id)
+        canonical_id = format_node_id(node_num)
+        admin_num = self._get_admin_node_num()
+        is_local = admin_num is not None and node_num == admin_num
+
+        # Prepare protobuf payloads for every staged change before opening the edit transaction
+        prepared_steps: List[Tuple[str, Any, Dict[str, Any]]] = []
+        for item in items:
+            kind = str(item.get("kind") or "").strip()
+            values = item.get("values") if isinstance(item.get("values"), dict) else {}
+            if not values:
+                continue
+
+            if kind in ("config", "module"):
+                section = str(item.get("section") or "").strip()
+                if kind == "config":
+                    if section not in CONFIG_SECTION_ENUM:
+                        raise ValueError(f"Unknown radio config section '{section}'")
+                    wrapper = config_pb2.Config()
+                else:
+                    if section not in MODULE_SECTION_ENUM:
+                        raise ValueError(f"Unknown module config section '{section}'")
+                    wrapper = module_config_pb2.ModuleConfig()
+
+                sub_pb = getattr(wrapper, section)
+                if not blind_overwrite:
+                    try:
+                        current_dict = self.get_config_section(canonical_id, kind, section, refresh=False)
+                        apply_dict_to_protobuf(sub_pb, current_dict)
+                        if kind == "config" and section == "security" and current_dict.get("public_key"):
+                            sub_pb.public_key = base64.b64decode(current_dict["public_key"])
+                    except Exception:
+                        pass
+                elif kind == "config" and section == "security":
+                    # Even in blind mode, preserve known public_key from NodeDB if present
+                    with self._lock:
+                        nd = (self._iface.nodesByNum or {}).get(node_num) if self._iface else None
+                        pk_b64 = ((nd or {}).get("user") or {}).get("publicKey")
+                        if pk_b64:
+                            try:
+                                sub_pb.public_key = base64.b64decode(pk_b64)
+                            except Exception:
+                                pass
+
+                apply_dict_to_protobuf(sub_pb, values)
+                prepared_steps.append((kind, (section, sub_pb), values))
+
+            elif kind == "channel":
+                index = int(item.get("index", 0))
+                if not 0 <= index <= 7:
+                    raise ValueError("Channel index must be between 0 and 7")
+                ch_pb = channel_pb2.Channel()
+                ch_pb.index = index
+                if not blind_overwrite:
+                    try:
+                        existing = self.get_channel(canonical_id, index, refresh=False)
+                        apply_dict_to_channel(ch_pb, existing, index)
+                    except Exception:
+                        ch_pb.index = index
+                apply_dict_to_channel(ch_pb, values, index)
+                if index == 0 and ch_pb.role == channel_pb2.Channel.Role.DISABLED:
+                    ch_pb.role = channel_pb2.Channel.Role.PRIMARY
+                prepared_steps.append(("channel", (index, ch_pb), values))
+            else:
+                raise ValueError(f"Unsupported batch change kind '{kind}'")
+
+        if not prepared_steps:
+            raise ValueError("No non-empty parameter overrides provided.")
+
+        with self._admin_op_lock:
+            passkey = self._ensure_fresh_session_passkey(node_num)
+
+            begin_msg = admin_pb2.AdminMessage()
+            if passkey:
+                begin_msg.session_passkey = passkey
+            begin_msg.begin_edit_settings = True
+            self._send_admin_and_wait(node_num, begin_msg, want_data_response=False, timeout=14.0)
+
+            applied_sections: List[str] = []
+            for kind, target_obj, values in prepared_steps:
+                if kind in ("config", "module"):
+                    section, sub_pb = target_obj
+                    set_msg = admin_pb2.AdminMessage()
+                    if passkey:
+                        set_msg.session_passkey = passkey
+                    if kind == "config":
+                        getattr(set_msg.set_config, section).CopyFrom(sub_pb)
+                    else:
+                        getattr(set_msg.set_module_config, section).CopyFrom(sub_pb)
+                    self._send_admin_and_wait(node_num, set_msg, want_data_response=False, timeout=15.0)
+
+                    # Companion payloads if explicitly included in batch values
+                    if kind == "config" and section == "position" and values.get("fixed_position"):
+                        if any(k in values for k in ("_fixed_latitude", "_fixed_longitude", "_fixed_altitude")):
+                            lat = float(values.get("_fixed_latitude") or 0.0)
+                            lon = float(values.get("_fixed_longitude") or 0.0)
+                            alt = int(float(values.get("_fixed_altitude") or 0))
+                            if lat != 0.0 or lon != 0.0:
+                                fp_msg = admin_pb2.AdminMessage()
+                                if passkey:
+                                    fp_msg.session_passkey = passkey
+                                fp_msg.set_fixed_position.latitude_i = int(round(lat * 1e7))
+                                fp_msg.set_fixed_position.longitude_i = int(round(lon * 1e7))
+                                fp_msg.set_fixed_position.altitude = alt
+                                self._send_admin_and_wait(node_num, fp_msg, want_data_response=False, timeout=14.0)
+
+                    if kind == "module" and section == "external_notification" and "_ringtone" in values:
+                        rt_msg = admin_pb2.AdminMessage()
+                        if passkey:
+                            rt_msg.session_passkey = passkey
+                        rt_msg.set_ringtone_message = str(values.get("_ringtone") or "")[:230]
+                        self._send_admin_and_wait(node_num, rt_msg, want_data_response=False, timeout=14.0)
+
+                    if kind == "module" and section == "canned_message" and "_canned_messages" in values:
+                        cm_msg = admin_pb2.AdminMessage()
+                        if passkey:
+                            cm_msg.session_passkey = passkey
+                        cm_msg.set_canned_message_module_messages = str(values.get("_canned_messages") or "")[:200]
+                        self._send_admin_and_wait(node_num, cm_msg, want_data_response=False, timeout=14.0)
+
+                    saved_dict = protobuf_to_dict(sub_pb)
+                    with self._lock:
+                        self._remote_config_cache[(node_num, f"{kind}:{section}")] = dict(saved_dict)
+                        if is_local and self._iface and self._iface.localNode:
+                            local_container = (
+                                self._iface.localNode.localConfig
+                                if kind == "config"
+                                else self._iface.localNode.moduleConfig
+                            )
+                            if hasattr(local_container, section):
+                                getattr(local_container, section).CopyFrom(sub_pb)
+                    applied_sections.append(f"{kind}.{section}")
+
+                elif kind == "channel":
+                    index, ch_pb = target_obj
+                    set_msg = admin_pb2.AdminMessage()
+                    if passkey:
+                        set_msg.session_passkey = passkey
+                    set_msg.set_channel.CopyFrom(ch_pb)
+                    self._send_admin_and_wait(node_num, set_msg, want_data_response=False, timeout=15.0)
+                    with self._lock:
+                        self._remote_channels_cache.setdefault(node_num, {})[index] = ch_pb
+                        if is_local and self._iface and self._iface.localNode and self._iface.localNode.channels:
+                            self._iface.localNode.channels[index].CopyFrom(ch_pb)
+                    applied_sections.append(f"channel.{index}")
+
+            commit_msg = admin_pb2.AdminMessage()
+            if passkey:
+                commit_msg.session_passkey = passkey
+            commit_msg.commit_edit_settings = True
+            self._send_admin_and_wait(node_num, commit_msg, want_data_response=False, timeout=14.0)
+
+            return {
+                "ok": True,
+                "node_id": canonical_id,
+                "applied_sections": applied_sections,
+                "blind_overwrite": bool(blind_overwrite),
+            }
+
+    def apply_batch(
+        self,
+        node_ids: List[str],
+        *,
+        action: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+        changes: Optional[List[Dict[str, Any]]] = None,
+        blind_overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Execute a batch action or multi-parameter push across multiple nodes sequentially,
+        automatically ordering remote peers before the paired local Admin Node."""
+        cleaned_ids = [str(nid).strip() for nid in (node_ids or []) if str(nid).strip()]
+        if not cleaned_ids:
+            raise ValueError("Select at least one node for batch operation.")
+
+        admin_num = self._get_admin_node_num()
+        admin_id = format_node_id(admin_num) if admin_num is not None else None
+
+        # Deduplicate while ensuring remote peers execute BEFORE the paired Admin Node
+        seen: set[str] = set()
+        remote_ids: List[str] = []
+        include_local = False
+        for nid in cleaned_ids:
+            norm = format_node_id(to_node_num(nid))
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if admin_id and norm == admin_id:
+                include_local = True
+            else:
+                remote_ids.append(norm)
+        ordered_ids = remote_ids + ([admin_id] if include_local and admin_id else [])
+
+        # Ensure 'random256'/'random128' channel PSKs resolve once so all batch nodes share the same key
+        resolved_changes = changes
+        if changes:
+            import copy
+            import secrets
+
+            resolved_changes = copy.deepcopy(changes)
+            for chg in resolved_changes:
+                if isinstance(chg, dict) and chg.get("kind") == "channel" and isinstance(chg.get("values"), dict):
+                    psk_raw = str(chg["values"].get("psk_text") or "").strip().lower()
+                    if psk_raw in ("random", "random256"):
+                        chg["values"]["psk_text"] = "base64:" + base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+                    elif psk_raw == "random128":
+                        chg["values"]["psk_text"] = "base64:" + base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+
+        results: List[Dict[str, Any]] = []
+        succeeded = 0
+        for nid in ordered_ids:
+            try:
+                res = self.apply_batch_to_node(
+                    nid,
+                    action=action,
+                    params=params,
+                    changes=resolved_changes,
+                    blind_overwrite=blind_overwrite,
+                )
+                results.append({"node_id": nid, "ok": True, "result": res})
+                succeeded += 1
+            except Exception as exc:
+                results.append({"node_id": nid, "ok": False, "error": str(exc)})
+
+        return {
+            "total": len(ordered_ids),
+            "succeeded": succeeded,
+            "failed": len(ordered_ids) - succeeded,
+            "results": results,
+        }
+
     def send_text_message(
         self,
         text: str,

@@ -44,6 +44,12 @@ A Python web dashboard for pairing to a Wi-Fi–connected Meshtastic **Admin Nod
   3. Meshtastic `2.5.x` vs `2.7.x` firmware handle local USB serial `pki_encrypted` flags and LittleFS commit timing differently.
 - **Smart Slot Management:** Inspects all 3 `admin_key` slots on the USB node, cross-references existing keys against known nodes in your mesh, automatically drops stale/unrecognized keys if all 3 slots are full, writes a properly `session_passkey`–authenticated `begin_edit_settings` / `commit_edit_settings` transaction across both `2.5.x` and `2.7.x` firmware, and syncs the enrolled node's public key straight into the active Admin Node session.
 
+### 6. Batch Fleet Actions & Multi-Node Force Parameter Push
+- Check multiple nodes in the mesh table (or use the header checkbox to select visible remote peers) and click **Edit Selected Nodes (N)** in the toolbar.
+- **Zero Pre-Read Mode:** Opens immediately (`0 ms`) without polling or reading current parameters from any target node.
+- **Fleet Power & Maintenance Actions:** Run **Shutdown Selected Nodes** (turn off all selected radios), **Reboot Selected Nodes**, **Sync All Clocks**, **Clear Fixed Positions**, or **Reset NodeDB** sequentially across the mesh — automatically ordering remote peers first and the local paired Admin Node last so your gateway never powers off before transmitting commands to the rest of the fleet.
+- **Multi-Section Force Parameter Override:** Check **Force parameter** on any combination of fields across all 9 Radio Config sections, all 16 Module Config sections, and Channels `0–7` (editing any field checks it automatically). Pushes all staged overrides per node inside a single `begin_edit_settings` / `commit_edit_settings` transaction with live per-node progress and an optional **Stop Remaining** cancel control.
+
 ---
 
 ## Architecture

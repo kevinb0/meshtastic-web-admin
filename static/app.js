@@ -17,6 +17,16 @@
       channelIndex: 0,
       loading: false,
     },
+    batch: {
+      selectedNodeIds: new Set(),
+      visibleFilteredNodes: [],
+      open: false,
+      activeTab: { type: "actions", key: "actions" }, // 'actions' | 'config' | 'module' | 'channels'
+      channelIndex: 0,
+      staged: {}, // { [secKey]: { checked: Set<string>, values: object } }
+      running: false,
+      cancelRequested: false,
+    },
   };
 
   // DOM Elements
@@ -44,6 +54,10 @@
     kpiAdmin: document.getElementById("kpi-admin"),
     kpiDirect: document.getElementById("kpi-direct"),
     kpiRelayed: document.getElementById("kpi-relayed"),
+    openBatchBtn: document.getElementById("open-batch-btn"),
+    batchSelCount: document.getElementById("batch-sel-count"),
+    clearBatchSelBtn: document.getElementById("clear-batch-sel-btn"),
+    selectAllNodesCb: document.getElementById("select-all-nodes-cb"),
     nodeSortBy: document.getElementById("node-sort-by"),
     nodeSortDir: document.getElementById("node-sort-dir"),
     thSortName: document.getElementById("th-sort-name"),
@@ -88,6 +102,28 @@
     usbNodeDetails: document.getElementById("usb-node-details"),
     usbEnrollFooter: document.getElementById("usb-enroll-footer"),
     usbWriteKeyBtn: document.getElementById("usb-write-key-btn"),
+    // Batch modal
+    batchModal: document.getElementById("batch-modal"),
+    batchModalCount: document.getElementById("batch-modal-count"),
+    batchTargetsStrip: document.getElementById("batch-targets-strip"),
+    batchCloseBtn: document.getElementById("batch-close-btn"),
+    batchModalNav: document.getElementById("batch-modal-nav"),
+    batchSectionTitle: document.getElementById("batch-section-title"),
+    batchSectionDesc: document.getElementById("batch-section-desc"),
+    batchSectionTools: document.getElementById("batch-section-tools"),
+    batchCheckSectionBtn: document.getElementById("batch-check-section-btn"),
+    batchClearSectionBtn: document.getElementById("batch-clear-section-btn"),
+    batchClearAllStagedBtn: document.getElementById("batch-clear-all-staged-btn"),
+    batchSectionWarning: document.getElementById("batch-section-warning"),
+    batchProgressPanel: document.getElementById("batch-progress-panel"),
+    batchProgressTitle: document.getElementById("batch-progress-title"),
+    batchCancelRunBtn: document.getElementById("batch-cancel-run-btn"),
+    batchProgressList: document.getElementById("batch-progress-list"),
+    batchFormContainer: document.getElementById("batch-form-container"),
+    batchApplyFooter: document.getElementById("batch-apply-footer"),
+    batchBlindOverwriteCb: document.getElementById("batch-blind-overwrite-cb"),
+    batchStagedSummary: document.getElementById("batch-staged-summary"),
+    batchForceApplyBtn: document.getElementById("batch-force-apply-btn"),
     toastContainer: document.getElementById("toast-container"),
   };
 
@@ -196,6 +232,8 @@
     }
 
     if (!conn.paired) {
+      state.batch.selectedNodeIds.clear();
+      syncBatchSelectionUI([]);
       el.adminCard.classList.add("hidden");
       el.dashboardMain.classList.add("hidden");
       el.unpairedEmpty.classList.remove("hidden");
@@ -293,8 +331,42 @@
     }
   }
 
+  function syncBatchSelectionUI(filtered) {
+    const count = state.batch.selectedNodeIds.size;
+    if (el.batchSelCount) el.batchSelCount.textContent = String(count);
+    if (el.openBatchBtn) el.openBatchBtn.disabled = count === 0;
+    if (el.clearBatchSelBtn) el.clearBatchSelBtn.classList.toggle("hidden", count === 0);
+
+    if (el.selectAllNodesCb) {
+      const remoteVisible = (filtered || []).filter((n) => !n.is_admin_node);
+      if (remoteVisible.length === 0) {
+        el.selectAllNodesCb.checked = false;
+        el.selectAllNodesCb.indeterminate = false;
+        el.selectAllNodesCb.disabled = true;
+      } else {
+        const selCount = remoteVisible.filter((n) => state.batch.selectedNodeIds.has(n.node_id)).length;
+        el.selectAllNodesCb.disabled = false;
+        el.selectAllNodesCb.checked = selCount === remoteVisible.length;
+        el.selectAllNodesCb.indeterminate = selCount > 0 && selCount < remoteVisible.length;
+      }
+    }
+
+    if (state.batch.open) {
+      renderBatchTargetsStrip();
+    }
+  }
+
   function renderNodesTable(nodes, nowSec) {
     syncSortControlsUI();
+
+    // Prune any selected node IDs that no longer exist in NodeDB while preserving selections across searches/filters
+    const presentIds = new Set((nodes || []).map((n) => n.node_id));
+    for (const selId of [...state.batch.selectedNodeIds]) {
+      if (!presentIds.has(selId)) {
+        state.batch.selectedNodeIds.delete(selId);
+      }
+    }
+
     const q = state.search.trim().toLowerCase();
     const filtered = nodes.filter((n) => {
       if (state.filter === "admin" && !n.has_admin) return false;
@@ -327,10 +399,13 @@
       });
     }
 
+    state.batch.visibleFilteredNodes = filtered;
+    syncBatchSelectionUI(filtered);
+
     if (filtered.length === 0) {
       el.nodesTbody.innerHTML = `
         <tr>
-          <td colspan="7" style="text-align:center; padding: 32px; color: var(--text-muted);">
+          <td colspan="8" style="text-align:center; padding: 32px; color: var(--text-muted);">
             No matching mesh nodes found.
           </td>
         </tr>`;
@@ -473,8 +548,19 @@
             </button>`;
         }
 
+        const isSelected = state.batch.selectedNodeIds.has(n.node_id);
+
         return `
-          <tr>
+          <tr class="${isSelected ? "batch-selected" : ""}">
+            <td class="col-check">
+              <input
+                type="checkbox"
+                class="batch-row-cb js-batch-node-cb"
+                data-node-id="${escapeHtml(n.node_id)}"
+                ${isSelected ? "checked" : ""}
+                title="Select ${escapeHtml(n.long_name)} (${escapeHtml(n.node_id)}) for batch actions or multi-node parameter push"
+              />
+            </td>
             <td class="col-icon">${iconCell}</td>
             <td>
               <div class="node-cell-title">
@@ -712,8 +798,76 @@
     el.sectionFormContainer.appendChild(grid);
   }
 
-  function createFieldElement(field, value, prefix) {
+  function attachBatchForceToggle(card, fieldName, initialChecked, onForceChange) {
+    const bar = document.createElement("div");
+    bar.className = "batch-force-check-bar";
+    bar.innerHTML = `
+      <label class="batch-force-check-label">
+        <input type="checkbox" class="js-batch-field-force" data-force-field="${escapeHtml(fieldName)}" ${initialChecked ? "checked" : ""} />
+        <span>Force parameter</span>
+      </label>
+      <span class="sig-sub js-batch-force-hint">${initialChecked ? "Will be pushed" : "Ignored"}</span>`;
+    card.prepend(bar);
+
+    const forceCb = bar.querySelector(".js-batch-field-force");
+    const hintEl = bar.querySelector(".js-batch-force-hint");
+
+    const applyVisual = (forced, notify = false) => {
+      forceCb.checked = forced;
+      card.classList.toggle("batch-forced", forced);
+      card.classList.toggle("batch-dimmed", !forced);
+      hintEl.textContent = forced ? "Will be pushed" : "Ignored";
+      if (notify && typeof onForceChange === "function") {
+        onForceChange(fieldName, forced);
+      }
+    };
+
+    applyVisual(Boolean(initialChecked), false);
+
+    forceCb.addEventListener("change", () => {
+      applyVisual(forceCb.checked, true);
+    });
+
+    const autoEnableOnEdit = (e) => {
+      if (e.target.closest(".batch-force-check-bar")) return;
+      if (!forceCb.checked) {
+        applyVisual(true, true);
+      } else if (typeof onForceChange === "function") {
+        onForceChange(fieldName, true);
+      }
+    };
+
+    card.addEventListener("input", autoEnableOnEdit);
+    card.addEventListener("change", autoEnableOnEdit);
+    card.addEventListener("click", (e) => {
+      const btn = e.target.closest("button");
+      if (!btn || btn.closest(".batch-force-check-bar")) return;
+      if (btn.classList.contains("js-copy-val") || btn.classList.contains("js-toggle-pw")) return;
+      // Defer slightly so row/preset click handlers mutate DOM first
+      setTimeout(() => {
+        if (!forceCb.checked) {
+          applyVisual(true, true);
+        } else if (typeof onForceChange === "function") {
+          onForceChange(fieldName, true);
+        }
+      }, 0);
+    });
+  }
+
+  function createFieldElement(field, value, prefix, opts = {}) {
+    const card = buildFieldCardCore(field, value, prefix, opts);
+    if (opts.batchTopLevel && !field.readOnly) {
+      const fKey = opts.forceFieldName || field.name;
+      attachBatchForceToggle(card, fKey, Boolean(opts.checkedFields?.has(fKey)), opts.onForceChange);
+    }
+    return card;
+  }
+
+  function buildFieldCardCore(field, value, prefix, opts = {}) {
+    const idPrefix = opts.idPrefix || "fld";
+    const childOpts = { ...opts, batchTopLevel: false };
     const path = prefix ? `${prefix}.${field.name}` : field.name;
+    const domId = `${idPrefix}-${path}`;
     const card = document.createElement("div");
     card.className = "field-card";
     if (["message", "message_list", "bytes_list", "bitflags"].includes(field.type) || field.helper === "admin_key") {
@@ -723,29 +877,29 @@
     if (field.type === "bool") {
       card.innerHTML = `
         <div class="toggle-row">
-          <label class="field-label" style="margin:0;" for="fld-${escapeHtml(path)}">
+          <label class="field-label" style="margin:0;" for="${escapeHtml(domId)}">
             ${escapeHtml(field.label)}
             <code class="field-name-code">${escapeHtml(field.name)}</code>
           </label>
-          <input id="fld-${escapeHtml(path)}" class="toggle-switch" type="checkbox"
+          <input id="${escapeHtml(domId)}" class="toggle-switch" type="checkbox"
             data-path="${escapeHtml(path)}" data-ftype="bool" ${value ? "checked" : ""} />
         </div>`;
       return card;
     }
 
     const labelHtml = `
-      <label class="field-label" for="fld-${escapeHtml(path)}">
+      <label class="field-label" for="${escapeHtml(domId)}">
         ${escapeHtml(field.label)}
         <code class="field-name-code">${escapeHtml(field.name)}</code>
       </label>`;
 
     if (field.type === "enum") {
-      const opts = (field.options || [])
+      const optsHtml = (field.options || [])
         .map((o) => `<option value="${o.value}" ${Number(value) === Number(o.value) ? "selected" : ""}>${escapeHtml(o.name)} (${o.value})</option>`)
         .join("");
       card.innerHTML = `${labelHtml}
-        <select id="fld-${escapeHtml(path)}" class="field-select" data-path="${escapeHtml(path)}" data-ftype="enum">
-          ${opts}
+        <select id="${escapeHtml(domId)}" class="field-select" data-path="${escapeHtml(path)}" data-ftype="enum">
+          ${optsHtml}
         </select>`;
       return card;
     }
@@ -763,7 +917,7 @@
         .join("");
       card.innerHTML = `
         ${labelHtml}
-        <input id="fld-${escapeHtml(path)}" class="field-input" type="number" min="0"
+        <input id="${escapeHtml(domId)}" class="field-input" type="number" min="0"
           data-path="${escapeHtml(path)}" data-ftype="uint" value="${mask}" />
         <div class="bitflags-grid">${checks}</div>`;
       const numInput = card.querySelector("input[type='number']");
@@ -836,7 +990,7 @@
     if (field.type === "nodenum_list") {
       const strVal = Array.isArray(value) ? value.join(", ") : String(value || "");
       card.innerHTML = `${labelHtml}
-        <input id="fld-${escapeHtml(path)}" class="field-input mono-id" type="text"
+        <input id="${escapeHtml(domId)}" class="field-input mono-id" type="text"
           placeholder="${escapeHtml(field.placeholder || "!12345678, !87654321")}"
           data-path="${escapeHtml(path)}" data-ftype="nodenum_list" value="${escapeHtml(strVal)}" />`;
       return card;
@@ -846,7 +1000,7 @@
       card.innerHTML = `${labelHtml}<div class="submessage-box form-grid"></div>`;
       const box = card.querySelector(".submessage-box");
       for (const sf of field.fields || []) {
-        box.appendChild(createFieldElement(sf, value?.[sf.name], path));
+        box.appendChild(createFieldElement(sf, value?.[sf.name], path, childOpts));
       }
       return card;
     }
@@ -866,7 +1020,7 @@
         const innerGrid = document.createElement("div");
         innerGrid.className = "form-grid";
         for (const sf of field.fields || []) {
-          innerGrid.appendChild(createFieldElement(sf, itemVal?.[sf.name], `${path}[${idx}]`));
+          innerGrid.appendChild(createFieldElement(sf, itemVal?.[sf.name], `${path}[${idx}]`, childOpts));
         }
         const rmBtn = document.createElement("button");
         rmBtn.type = "button";
@@ -887,9 +1041,9 @@
       card.innerHTML = `
         ${labelHtml}
         <div class="array-row">
-          <input id="fld-${escapeHtml(path)}" class="field-input" type="password"
+          <input id="${escapeHtml(domId)}" class="field-input" type="password"
             data-path="${escapeHtml(path)}" data-ftype="string" value="${escapeHtml(value ?? "")}" />
-          <button type="button" class="btn btn-ghost btn-xs">Show</button>
+          <button type="button" class="btn btn-ghost btn-xs js-toggle-pw">Show</button>
         </div>`;
       const inp = card.querySelector("input");
       const toggleBtn = card.querySelector("button");
@@ -905,7 +1059,7 @@
       card.innerHTML = `
         ${labelHtml}
         <div class="array-row">
-          <input id="fld-${escapeHtml(path)}" class="field-input mono-id" type="text"
+          <input id="${escapeHtml(domId)}" class="field-input mono-id" type="text"
             ${field.readOnly ? "readonly" : ""}
             placeholder="Base64 bytes"
             data-path="${escapeHtml(path)}" data-ftype="bytes" data-readonly="${field.readOnly ? "1" : "0"}"
@@ -927,7 +1081,7 @@
     const maxLenAttr = field.maxLength ? `maxlength="${field.maxLength}"` : "";
     card.innerHTML = `
       ${labelHtml}
-      <input id="fld-${escapeHtml(path)}" class="field-input" type="${inputType}"
+      <input id="${escapeHtml(domId)}" class="field-input" type="${inputType}"
         ${ inputType === "number" ? stepAttr : "" }
         ${maxLenAttr}
         placeholder="${escapeHtml(field.placeholder || "")}"
@@ -936,19 +1090,19 @@
     return card;
   }
 
-  function collectSchemaValues(fields, prefix = "") {
+  function collectSchemaValues(fields, prefix = "", containerEl = el.sectionFormContainer) {
     const out = {};
     for (const f of fields) {
       const path = prefix ? `${prefix}.${f.name}` : f.name;
       if (f.readOnly) continue;
 
       if (f.type === "message") {
-        out[f.name] = collectSchemaValues(f.fields || [], path);
+        out[f.name] = collectSchemaValues(f.fields || [], path, containerEl);
         continue;
       }
 
       if (f.type === "message_list") {
-        const listEl = el.sectionFormContainer.querySelector(`[data-msg-list="${CSS.escape(path)}"]`);
+        const listEl = containerEl.querySelector(`[data-msg-list="${CSS.escape(path)}"]`);
         const items = [];
         if (listEl) {
           [...listEl.children].forEach((wrap) => {
@@ -967,12 +1121,12 @@
       }
 
       if (f.type === "bytes_list") {
-        const inputs = el.sectionFormContainer.querySelectorAll(`[data-bytes-item="${CSS.escape(path)}"]`);
+        const inputs = containerEl.querySelectorAll(`[data-bytes-item="${CSS.escape(path)}"]`);
         out[f.name] = [...inputs].map((i) => i.value.trim()).filter(Boolean);
         continue;
       }
 
-      const input = el.sectionFormContainer.querySelector(`[data-path="${CSS.escape(path)}"]`);
+      const input = containerEl.querySelector(`[data-path="${CSS.escape(path)}"]`);
       if (!input) continue;
       out[f.name] = readSingleInput(input);
     }
@@ -1204,6 +1358,690 @@
   }
 
   // ------------------------------------------------------------------
+  // Batch Fleet Actions & Multi-Node Force Parameter Modal
+  // ------------------------------------------------------------------
+  function getOrderedBatchNodes() {
+    const nodesById = new Map((state.snapshot?.nodes || []).map((n) => [n.node_id, n]));
+    const remote = [];
+    const localAdmin = [];
+    for (const id of state.batch.selectedNodeIds) {
+      const node = nodesById.get(id) || { node_id: id, long_name: id, short_name: "", is_admin_node: false, has_admin: false };
+      if (node.is_admin_node) {
+        localAdmin.push(node);
+      } else {
+        remote.push(node);
+      }
+    }
+    // Always execute remote mesh peers BEFORE the paired local HTTP Admin Node
+    return [...remote, ...localAdmin];
+  }
+
+  function renderBatchTargetsStrip() {
+    if (!el.batchTargetsStrip) return;
+    const ordered = getOrderedBatchNodes();
+    if (el.batchModalCount) {
+      el.batchModalCount.textContent = `${ordered.length} selected`;
+    }
+    if (!ordered.length) {
+      el.batchTargetsStrip.innerHTML = `<span class="muted-sm">No nodes currently selected. Close this window and check one or more nodes in the table.</span>`;
+      updateBatchStagedSummaryUI();
+      return;
+    }
+
+    el.batchTargetsStrip.innerHTML = ordered
+      .map((n) => {
+        const roleTag = n.is_admin_node
+          ? `<span class="eyebrow-badge" style="margin-left:2px;">LOCAL · LAST</span>`
+          : !n.has_admin
+          ? `<span class="muted-sm" title="Admin Power has not been verified yet; batch will still attempt force-send">(unverified)</span>`
+          : "";
+        const rmBtn = !state.batch.running
+          ? `<button type="button" class="js-batch-rm-target" data-node-id="${escapeHtml(n.node_id)}"
+               title="Remove ${escapeHtml(n.long_name)} from selection"
+               style="background:none;border:none;color:var(--text-muted);cursor:pointer;padding:0 2px;font-size:0.95rem;line-height:1;">&times;</button>`
+          : "";
+        return `
+          <span class="batch-target-pill">
+            <strong>${escapeHtml(n.long_name || n.node_id)}</strong>
+            <code>${escapeHtml(n.node_id)}</code>
+            ${roleTag}
+            ${rmBtn}
+          </span>`;
+      })
+      .join("");
+
+    el.batchTargetsStrip.querySelectorAll(".js-batch-rm-target").forEach((btn) => {
+      btn.onclick = () => {
+        if (state.batch.running) return;
+        state.batch.selectedNodeIds.delete(btn.dataset.nodeId);
+        if (state.snapshot) renderSnapshot(state.snapshot);
+        renderBatchTargetsStrip();
+      };
+    });
+
+    updateBatchStagedSummaryUI();
+  }
+
+  function getBatchSecKey(tab, chIdx = state.batch.channelIndex) {
+    if (!tab) return null;
+    if (tab.type === "config") return `config:${tab.key}`;
+    if (tab.type === "module") return `module:${tab.key}`;
+    if (tab.type === "channels") return `channel:${chIdx}`;
+    return null;
+  }
+
+  function buildDefaultFieldValues(fields, sectionKey = "") {
+    const out = {};
+    const adminRegionName = state.snapshot?.admin_node?.lora_region || "";
+    for (const f of fields || []) {
+      if (f.readOnly) continue;
+      if (f.type === "bool") {
+        out[f.name] = sectionKey === "lora" && f.name === "use_preset" ? true : false;
+      } else if (f.type === "enum") {
+        if (sectionKey === "lora" && f.name === "region" && adminRegionName) {
+          const match = (f.options || []).find((o) => o.name === adminRegionName);
+          out[f.name] = match ? match.value : f.options?.[0]?.value ?? 0;
+        } else {
+          out[f.name] = f.options?.[0]?.value ?? 0;
+        }
+      } else if (f.type === "uint" || f.type === "int" || f.type === "float" || f.type === "bitflags") {
+        out[f.name] = sectionKey === "lora" && f.name === "hop_limit" ? 3 : 0;
+      } else if (f.type === "bytes_list" || f.type === "message_list" || f.type === "nodenum_list") {
+        out[f.name] = [];
+      } else if (f.type === "message") {
+        out[f.name] = buildDefaultFieldValues(f.fields || [], "");
+      } else {
+        out[f.name] = "";
+      }
+    }
+    return out;
+  }
+
+  function snapshotCurrentBatchTab() {
+    if (!state.batch.open || !state.schema) return;
+    const tab = state.batch.activeTab;
+    if (!tab || tab.type === "actions") return;
+
+    const checkedBoxes = el.batchFormContainer.querySelectorAll(".js-batch-field-force:checked");
+    const checkedSet = new Set([...checkedBoxes].map((cb) => cb.dataset.forceField).filter(Boolean));
+
+    if (tab.type === "config" || tab.type === "module") {
+      const secMeta = getSectionSchema(tab.type, tab.key);
+      if (!secMeta) return;
+      const secKey = getBatchSecKey(tab);
+      const values = collectSchemaValues(secMeta.fields || [], "", el.batchFormContainer);
+      state.batch.staged[secKey] = {
+        kind: tab.type,
+        section: tab.key,
+        checked: checkedSet,
+        values,
+      };
+    } else if (tab.type === "channels") {
+      const idx = state.batch.channelIndex;
+      const secKey = `channel:${idx}`;
+      const chSchema = state.schema.channels;
+      const fieldsNoPsk = (chSchema.fields || []).filter((f) => f.name !== "psk");
+      const roleEl = document.getElementById("batch-ch-role-select");
+      const pskEl = document.getElementById("batch-ch-psk-input");
+      if (!roleEl || !pskEl) return;
+      const settingsVals = collectSchemaValues(fieldsNoPsk, "bch_settings", el.batchFormContainer);
+      state.batch.staged[secKey] = {
+        kind: "channel",
+        index: idx,
+        checked: checkedSet,
+        values: {
+          role: parseInt(roleEl.value, 10),
+          psk_text: pskEl.value.trim(),
+          settings: settingsVals,
+        },
+      };
+    }
+  }
+
+  function getStagedCounts() {
+    let totalParams = 0;
+    let totalSections = 0;
+    let channelTotal = 0;
+    const bySecKey = {};
+
+    for (const [secKey, entry] of Object.entries(state.batch.staged)) {
+      const n = entry?.checked ? entry.checked.size : 0;
+      bySecKey[secKey] = n;
+      if (n > 0) {
+        totalParams += n;
+        totalSections += 1;
+        if (secKey.startsWith("channel:")) {
+          channelTotal += n;
+        }
+      }
+    }
+    return { totalParams, totalSections, channelTotal, bySecKey };
+  }
+
+  function updateBatchStagedSummaryUI() {
+    const { totalParams, totalSections, channelTotal, bySecKey } = getStagedCounts();
+    const targetCount = state.batch.selectedNodeIds.size;
+
+    if (el.batchModalNav) {
+      el.batchModalNav.querySelectorAll(".nav-item-btn").forEach((btn) => {
+        const t = btn.dataset.tabType;
+        const k = btn.dataset.tabKey;
+        let c = 0;
+        if (t === "config" || t === "module") {
+          c = bySecKey[`${t}:${k}`] || 0;
+        } else if (t === "channels") {
+          c = channelTotal;
+        }
+        const badge = btn.querySelector(".js-batch-nav-badge");
+        if (badge) {
+          badge.textContent = String(c);
+          badge.classList.toggle("hidden", c === 0);
+        }
+      });
+    }
+
+    if (el.batchStagedSummary) {
+      el.batchStagedSummary.textContent =
+        totalParams === 0
+          ? "0 parameters checked"
+          : `${totalParams} parameter${totalParams === 1 ? "" : "s"} across ${totalSections} section${totalSections === 1 ? "" : "s"} staged`;
+    }
+
+    if (el.batchForceApplyBtn) {
+      el.batchForceApplyBtn.disabled = state.batch.running || totalParams === 0 || targetCount === 0;
+      el.batchForceApplyBtn.textContent =
+        totalParams > 0 && targetCount > 0
+          ? `Force Apply ${totalParams} Param${totalParams === 1 ? "" : "s"} to ${targetCount} Node${targetCount === 1 ? "" : "s"}`
+          : "Force Apply to Selected Nodes";
+    }
+  }
+
+  async function openBatchModal() {
+    await loadSchema();
+    state.batch.open = true;
+    renderBatchTargetsStrip();
+    buildBatchSidebar();
+    el.batchModal.classList.remove("hidden");
+    selectBatchTab(state.batch.activeTab || { type: "actions", key: "actions" }, true);
+  }
+
+  function closeBatchModal() {
+    if (state.batch.running) {
+      showToast("Batch operation is currently running — click 'Stop Remaining' first.", "err");
+      return;
+    }
+    snapshotCurrentBatchTab();
+    state.batch.open = false;
+    el.batchModal.classList.add("hidden");
+  }
+
+  function buildBatchSidebar() {
+    const sc = state.schema;
+    const groups = [
+      {
+        label: "Fleet Operations",
+        items: [{ type: "actions", key: "actions", title: "Batch Actions (Power / Clock)" }],
+      },
+      {
+        label: "Radio Config (Force Push)",
+        items: (sc.config || []).map((s) => ({ type: "config", key: s.key, title: s.title })),
+      },
+      {
+        label: "Module Config (Force Push)",
+        items: (sc.module || []).map((s) => ({ type: "module", key: s.key, title: s.title })),
+      },
+      {
+        label: "Channels (Force Push)",
+        items: [{ type: "channels", key: "channels", title: "Channels (0–7)" }],
+      },
+    ];
+
+    el.batchModalNav.innerHTML = groups
+      .map(
+        (g) => `
+        <div class="nav-group-label">${escapeHtml(g.label)}</div>
+        ${g.items
+          .map(
+            (item) => `
+          <button type="button" class="nav-item-btn" data-tab-type="${item.type}" data-tab-key="${item.key}">
+            <span>${escapeHtml(item.title)}</span>
+            <span class="nav-count-badge js-batch-nav-badge hidden">0</span>
+          </button>`
+          )
+          .join("")}`
+      )
+      .join("");
+
+    el.batchModalNav.querySelectorAll(".nav-item-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        selectBatchTab({ type: btn.dataset.tabType, key: btn.dataset.tabKey });
+      });
+    });
+
+    updateBatchStagedSummaryUI();
+  }
+
+  function selectBatchTab(tab, skipSnapshot = false) {
+    if (!skipSnapshot) {
+      snapshotCurrentBatchTab();
+    }
+    state.batch.activeTab = tab;
+
+    el.batchModalNav.querySelectorAll(".nav-item-btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.tabType === tab.type && b.dataset.tabKey === tab.key);
+    });
+
+    el.batchSectionWarning.classList.add("hidden");
+
+    if (tab.type === "actions") {
+      el.batchSectionTitle.textContent = "Batch Fleet Actions";
+      el.batchSectionDesc.textContent =
+        "Transmit an immediate administrative command to every selected node sequentially (remote peers run first; local paired Admin Node runs last).";
+      el.batchSectionTools.classList.add("hidden");
+      el.batchApplyFooter.classList.add("hidden");
+      renderBatchActionsPane();
+      updateBatchStagedSummaryUI();
+      return;
+    }
+
+    el.batchSectionTools.classList.remove("hidden");
+    el.batchApplyFooter.classList.remove("hidden");
+
+    const sectionMeta = getSectionSchema(tab.type, tab.key);
+    el.batchSectionTitle.textContent = sectionMeta?.title || tab.key;
+    el.batchSectionDesc.textContent =
+      (sectionMeta?.description ? `${sectionMeta.description} ` : "") +
+      "Check 'Force parameter' on any fields you want to push (editing a field checks it automatically).";
+    if (sectionMeta?.warning) {
+      el.batchSectionWarning.textContent = sectionMeta.warning;
+      el.batchSectionWarning.classList.remove("hidden");
+    }
+
+    if (tab.type === "config" || tab.type === "module") {
+      renderBatchSchemaPane(tab, sectionMeta);
+    } else if (tab.type === "channels") {
+      renderBatchChannelPane(state.batch.channelIndex, true);
+    }
+    updateBatchStagedSummaryUI();
+  }
+
+  function renderBatchActionsPane() {
+    el.batchFormContainer.innerHTML = `
+      <div class="actions-grid">
+        <div class="action-box" style="border-color: rgba(248, 113, 113, 0.35);">
+          <div>
+            <h4>Turn Off / Shutdown Selected Nodes</h4>
+            <p class="muted-sm">Power down all selected radios in 5 seconds. Remote mesh nodes are shut down first before the local Admin Node (if selected).</p>
+          </div>
+          <button type="button" class="btn btn-danger btn-sm" data-batch-act="shutdown">Shutdown Selected Nodes</button>
+        </div>
+        <div class="action-box">
+          <div>
+            <h4>Reboot Selected Nodes</h4>
+            <p class="muted-sm">Gracefully restart radio firmware in 5 seconds across all selected nodes.</p>
+          </div>
+          <button type="button" class="btn btn-danger btn-sm" data-batch-act="reboot">Reboot Selected Nodes</button>
+        </div>
+        <div class="action-box">
+          <div>
+            <h4>Sync Clock on Selected Nodes</h4>
+            <p class="muted-sm">Push your computer's current UTC timestamp to every selected node's RTC clock.</p>
+          </div>
+          <button type="button" class="btn btn-secondary btn-sm" data-batch-act="sync_time">Sync All Clocks</button>
+        </div>
+        <div class="action-box">
+          <div>
+            <h4>Clear Fixed Position</h4>
+            <p class="muted-sm">Remove stored fixed GPS coordinates on all selected nodes.</p>
+          </div>
+          <button type="button" class="btn btn-secondary btn-sm" data-batch-act="remove_fixed_position">Clear Fixed Positions</button>
+        </div>
+        <div class="action-box">
+          <div>
+            <h4>Reset NodeDB on Selected Nodes</h4>
+            <p class="muted-sm">Clear cached peer node entries on all selected devices (preserves radio config &amp; channels).</p>
+          </div>
+          <button type="button" class="btn btn-danger btn-sm" data-batch-act="reset_nodedb">Reset NodeDB</button>
+        </div>
+      </div>`;
+
+    el.batchFormContainer.querySelectorAll("[data-batch-act]").forEach((btn) => {
+      btn.onclick = async () => {
+        if (state.batch.running) return;
+        const act = btn.dataset.batchAct;
+        const ordered = getOrderedBatchNodes();
+        if (!ordered.length) {
+          showToast("Select at least one node first.", "err");
+          return;
+        }
+        const includesLocal = ordered.some((n) => n.is_admin_node);
+        if (["shutdown", "reboot", "reset_nodedb"].includes(act)) {
+          const localWarn = includesLocal
+            ? "\n\nNOTE: Your paired local Admin Node IS selected and will execute LAST."
+            : "";
+          if (!confirm(`Send '${act}' to ${ordered.length} selected node(s)?${localWarn}`)) {
+            return;
+          }
+        }
+        await runBatchExecution({
+          label: `Batch Action '${act}'`,
+          action: act,
+          params: {},
+        });
+      };
+    });
+  }
+
+  function renderBatchSchemaPane(tab, sectionMeta) {
+    const secKey = getBatchSecKey(tab);
+    const existing = state.batch.staged[secKey];
+    const initialValues = existing?.values || buildDefaultFieldValues(sectionMeta.fields || [], tab.key);
+    const checkedFields = existing?.checked || new Set();
+
+    el.batchFormContainer.innerHTML = "";
+    const grid = document.createElement("div");
+    grid.className = "form-grid";
+
+    const handleForceChange = () => {
+      snapshotCurrentBatchTab();
+      updateBatchStagedSummaryUI();
+    };
+
+    for (const f of sectionMeta.fields || []) {
+      if (f.readOnly) continue;
+      grid.appendChild(
+        createFieldElement(f, initialValues?.[f.name], "", {
+          idPrefix: `bfld-${tab.type}-${tab.key}`,
+          batchTopLevel: true,
+          checkedFields,
+          onForceChange: handleForceChange,
+        })
+      );
+    }
+    el.batchFormContainer.appendChild(grid);
+  }
+
+  function generateRandomBase64Key(byteLen = 32) {
+    const bytes = new Uint8Array(byteLen);
+    window.crypto.getRandomValues(bytes);
+    let bin = "";
+    bytes.forEach((b) => {
+      bin += String.fromCharCode(b);
+    });
+    return `base64:${btoa(bin)}`;
+  }
+
+  function renderBatchChannelPane(index, skipSnapshot = false) {
+    if (!skipSnapshot) {
+      snapshotCurrentBatchTab();
+    }
+    state.batch.channelIndex = index;
+    const chSchema = state.schema.channels;
+    const secKey = `channel:${index}`;
+    const existing = state.batch.staged[secKey];
+    const fieldsNoPsk = (chSchema.fields || []).filter((f) => f.name !== "psk");
+
+    const initRole = existing?.values?.role ?? (index === 0 ? 1 : 2);
+    const initPsk = existing?.values?.psk_text ?? (index === 0 ? "default" : "default");
+    const initSettings = existing?.values?.settings || buildDefaultFieldValues(fieldsNoPsk, "");
+    const checkedFields = existing?.checked || new Set();
+
+    const tabsHtml = Array.from({ length: 8 }, (_, i) => {
+      const cnt = state.batch.staged[`channel:${i}`]?.checked?.size || 0;
+      const badge = cnt > 0 ? ` (${cnt})` : "";
+      const label = i === 0 ? `Ch 0 (Primary)${badge}` : `Ch ${i}${badge}`;
+      return `<button type="button" class="ch-tab-btn ${i === index ? "active" : ""}" data-bch-idx="${i}">${escapeHtml(label)}</button>`;
+    }).join("");
+
+    const roleOpts = (chSchema.roles || [])
+      .filter((r) => !(index === 0 && r.name !== "PRIMARY"))
+      .map((r) => `<option value="${r.value}" ${Number(initRole) === Number(r.value) ? "selected" : ""}>${escapeHtml(r.name)}</option>`)
+      .join("");
+
+    el.batchFormContainer.innerHTML = `<div class="channel-tabs">${tabsHtml}</div><div class="form-grid" id="batch-ch-grid"></div>`;
+    const grid = document.getElementById("batch-ch-grid");
+
+    const handleForceChange = () => {
+      snapshotCurrentBatchTab();
+      updateBatchStagedSummaryUI();
+      // Keep Ch tab count label fresh
+      const activeBtn = el.batchFormContainer.querySelector(`.ch-tab-btn[data-bch-idx="${index}"]`);
+      if (activeBtn) {
+        const cnt = state.batch.staged[secKey]?.checked?.size || 0;
+        activeBtn.textContent = index === 0 ? `Ch 0 (Primary)${cnt ? ` (${cnt})` : ""}` : `Ch ${index}${cnt ? ` (${cnt})` : ""}`;
+      }
+    };
+
+    // Role card
+    const roleCard = document.createElement("div");
+    roleCard.className = "field-card";
+    roleCard.innerHTML = `
+      <label class="field-label" for="batch-ch-role-select">Channel Role <code class="field-name-code">role</code></label>
+      <select id="batch-ch-role-select" class="field-select">${roleOpts}</select>`;
+    attachBatchForceToggle(roleCard, "role", checkedFields.has("role"), handleForceChange);
+    grid.appendChild(roleCard);
+
+    // PSK card
+    const pskCard = document.createElement("div");
+    pskCard.className = "field-card full-span";
+    pskCard.innerHTML = `
+      <label class="field-label" for="batch-ch-psk-input">Encryption Key (PSK) <code class="field-name-code">psk</code></label>
+      <div class="array-row" style="flex-wrap:wrap;">
+        <input id="batch-ch-psk-input" type="text" class="field-input mono-id" style="flex:1; min-width:240px;"
+          value="${escapeHtml(initPsk)}"
+          placeholder="default | none | base64:..." />
+        <button type="button" class="btn btn-secondary btn-xs" data-bpsk-preset="default">Default Key</button>
+        <button type="button" class="btn btn-secondary btn-xs" data-bpsk-preset="none">No Encryption</button>
+        <button type="button" class="btn btn-primary btn-xs" data-bpsk-preset="shared256">Generate Shared 256-bit Key</button>
+      </div>
+      <p class="sig-sub" style="margin:5px 0 0;">All selected nodes receive the exact same key when forced.</p>`;
+    attachBatchForceToggle(pskCard, "psk_text", checkedFields.has("psk_text"), handleForceChange);
+    grid.appendChild(pskCard);
+
+    pskCard.querySelectorAll("[data-bpsk-preset]").forEach((btn) => {
+      btn.onclick = () => {
+        const mode = btn.dataset.bpskPreset;
+        const inp = document.getElementById("batch-ch-psk-input");
+        inp.value = mode === "shared256" ? generateRandomBase64Key(32) : mode;
+      };
+    });
+
+    for (const sf of fieldsNoPsk) {
+      grid.appendChild(
+        createFieldElement(sf, initSettings?.[sf.name], "bch_settings", {
+          idPrefix: `bfld-ch${index}`,
+          batchTopLevel: true,
+          forceFieldName: `settings.${sf.name}`,
+          checkedFields,
+          onForceChange: handleForceChange,
+        })
+      );
+    }
+
+    el.batchFormContainer.querySelectorAll(".ch-tab-btn").forEach((btn) => {
+      btn.onclick = () => renderBatchChannelPane(Number(btn.dataset.bchIdx), false);
+    });
+  }
+
+  function setCurrentBatchSectionChecked(checked) {
+    el.batchFormContainer.querySelectorAll(".js-batch-field-force").forEach((cb) => {
+      if (cb.checked !== checked) {
+        cb.checked = checked;
+        cb.dispatchEvent(new Event("change"));
+      }
+    });
+    snapshotCurrentBatchTab();
+    updateBatchStagedSummaryUI();
+  }
+
+  function resetAllStagedBatchParams() {
+    state.batch.staged = {};
+    selectBatchTab(state.batch.activeTab, true);
+    updateBatchStagedSummaryUI();
+  }
+
+  function buildStagedBatchChanges() {
+    snapshotCurrentBatchTab();
+    const changes = [];
+
+    for (const entry of Object.values(state.batch.staged)) {
+      if (!entry || !entry.checked || entry.checked.size === 0) continue;
+
+      if (entry.kind === "config" || entry.kind === "module") {
+        const filteredVals = {};
+        for (const fieldName of entry.checked) {
+          if (Object.prototype.hasOwnProperty.call(entry.values, fieldName)) {
+            filteredVals[fieldName] = entry.values[fieldName];
+          }
+        }
+        if (Object.keys(filteredVals).length > 0) {
+          changes.push({
+            kind: entry.kind,
+            section: entry.section,
+            values: filteredVals,
+          });
+        }
+      } else if (entry.kind === "channel") {
+        const chPayload = {};
+        if (entry.checked.has("role")) {
+          chPayload.role = entry.values.role;
+        }
+        if (entry.checked.has("psk_text")) {
+          const rawPsk = String(entry.values.psk_text || "").trim();
+          const lower = rawPsk.toLowerCase();
+          if (lower === "random" || lower === "random256") {
+            chPayload.psk_text = generateRandomBase64Key(32);
+          } else if (lower === "random128") {
+            chPayload.psk_text = generateRandomBase64Key(16);
+          } else {
+            chPayload.psk_text = rawPsk;
+          }
+        }
+        const settingsOut = {};
+        for (const ck of entry.checked) {
+          if (ck.startsWith("settings.")) {
+            const sfName = ck.slice("settings.".length);
+            if (entry.values.settings && Object.prototype.hasOwnProperty.call(entry.values.settings, sfName)) {
+              settingsOut[sfName] = entry.values.settings[sfName];
+            }
+          }
+        }
+        if (Object.keys(settingsOut).length > 0) {
+          chPayload.settings = settingsOut;
+        }
+        if (Object.keys(chPayload).length > 0) {
+          changes.push({
+            kind: "channel",
+            index: entry.index,
+            values: chPayload,
+          });
+        }
+      }
+    }
+    return changes;
+  }
+
+  async function runBatchExecution({ label, action = null, params = {}, changes = null, blindOverwrite = false }) {
+    const ordered = getOrderedBatchNodes();
+    if (!ordered.length) {
+      showToast("No nodes selected for batch operation.", "err");
+      return;
+    }
+
+    state.batch.running = true;
+    state.batch.cancelRequested = false;
+    renderBatchTargetsStrip();
+    updateBatchStagedSummaryUI();
+
+    el.batchProgressPanel.classList.remove("hidden");
+    el.batchCancelRunBtn.classList.remove("hidden");
+    el.batchCancelRunBtn.disabled = false;
+    el.batchCancelRunBtn.textContent = "Stop Remaining";
+    el.batchProgressTitle.textContent = `${label} — 0 / ${ordered.length} completed...`;
+
+    el.batchProgressList.innerHTML = ordered
+      .map(
+        (n) => `
+        <div class="batch-progress-row" data-prog-node="${escapeHtml(n.node_id)}">
+          <span>
+            <strong>${escapeHtml(n.long_name || n.node_id)}</strong>
+            <code>${escapeHtml(n.node_id)}</code>
+            ${n.is_admin_node ? `<span class="eyebrow-badge">LOCAL</span>` : ""}
+          </span>
+          <span class="js-prog-status muted-sm">Queued</span>
+        </div>`
+      )
+      .join("");
+
+    let succeeded = 0;
+    let failed = 0;
+    let processed = 0;
+
+    for (const node of ordered) {
+      const row = el.batchProgressList.querySelector(`[data-prog-node="${CSS.escape(node.node_id)}"]`);
+      const stEl = row?.querySelector(".js-prog-status");
+
+      if (state.batch.cancelRequested) {
+        if (stEl) stEl.textContent = "Stopped / Skipped";
+        continue;
+      }
+
+      if (row) row.classList.add("running");
+      if (stEl) {
+        stEl.className = "js-prog-status";
+        stEl.textContent = "Transmitting over LoRa...";
+      }
+
+      try {
+        const body = action
+          ? { action, params }
+          : { changes, blind_overwrite: Boolean(blindOverwrite) };
+        const res = await apiJson(`/api/node/${encodeURIComponent(node.node_id)}/batch`, {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        succeeded += 1;
+        if (row) {
+          row.classList.remove("running");
+          row.classList.add("ok");
+        }
+        if (stEl) {
+          const appliedList = res.applied_sections || res.result?.applied_sections || [];
+          const appliedTxt = appliedList.length
+            ? `✓ Saved (${appliedList.join(", ")})`
+            : `✓ ${action} sent`;
+          stEl.textContent = appliedTxt;
+        }
+      } catch (err) {
+        failed += 1;
+        if (row) {
+          row.classList.remove("running");
+          row.classList.add("err");
+        }
+        if (stEl) {
+          stEl.textContent = `✕ ${err.message}`;
+        }
+      }
+
+      processed += 1;
+      el.batchProgressTitle.textContent = `${label} — ${processed} / ${ordered.length} processed (${succeeded} ok, ${failed} failed)`;
+    }
+
+    state.batch.running = false;
+    el.batchCancelRunBtn.classList.add("hidden");
+    renderBatchTargetsStrip();
+    updateBatchStagedSummaryUI();
+
+    const stoppedNote = state.batch.cancelRequested ? " (stopped early)" : "";
+    el.batchProgressTitle.textContent = `${label} finished${stoppedNote}: ${succeeded} succeeded, ${failed} failed.`;
+    showToast(
+      `${label}: ${succeeded}/${ordered.length} succeeded${failed ? ` (${failed} failed)` : ""}`,
+      failed > 0 && succeeded === 0 ? "err" : "ok"
+    );
+    await refreshState();
+  }
+
+  // ------------------------------------------------------------------
   // Traceroute Popup
   // ------------------------------------------------------------------
   function showTracerouteModal(nodeId, tr) {
@@ -1360,6 +2198,47 @@
       syncSortControlsUI();
       if (state.snapshot) renderSnapshot(state.snapshot);
     });
+  });
+
+  if (el.openBatchBtn) {
+    el.openBatchBtn.addEventListener("click", openBatchModal);
+  }
+
+  if (el.clearBatchSelBtn) {
+    el.clearBatchSelBtn.addEventListener("click", () => {
+      state.batch.selectedNodeIds.clear();
+      if (state.snapshot) renderSnapshot(state.snapshot);
+    });
+  }
+
+  if (el.selectAllNodesCb) {
+    el.selectAllNodesCb.addEventListener("change", () => {
+      const check = el.selectAllNodesCb.checked;
+      const remoteVisible = (state.batch.visibleFilteredNodes || []).filter((n) => !n.is_admin_node);
+      for (const n of remoteVisible) {
+        if (check) {
+          state.batch.selectedNodeIds.add(n.node_id);
+        } else {
+          state.batch.selectedNodeIds.delete(n.node_id);
+        }
+      }
+      if (state.snapshot) renderSnapshot(state.snapshot);
+    });
+  }
+
+  el.nodesTbody.addEventListener("change", (e) => {
+    const cb = e.target.closest(".js-batch-node-cb");
+    if (!cb) return;
+    const nodeId = cb.dataset.nodeId;
+    if (!nodeId) return;
+    if (cb.checked) {
+      state.batch.selectedNodeIds.add(nodeId);
+    } else {
+      state.batch.selectedNodeIds.delete(nodeId);
+    }
+    const tr = cb.closest("tr");
+    if (tr) tr.classList.toggle("batch-selected", cb.checked);
+    syncBatchSelectionUI(state.batch.visibleFilteredNodes);
   });
 
   // Delegated clicks inside Nodes Table
@@ -1632,12 +2511,75 @@
     if (e.target === el.traceModal) el.traceModal.classList.add("hidden");
   });
 
+  if (el.batchCloseBtn) {
+    el.batchCloseBtn.addEventListener("click", closeBatchModal);
+  }
+  if (el.batchModal) {
+    el.batchModal.addEventListener("click", (e) => {
+      if (e.target === el.batchModal) closeBatchModal();
+    });
+  }
+  if (el.batchCheckSectionBtn) {
+    el.batchCheckSectionBtn.addEventListener("click", () => setCurrentBatchSectionChecked(true));
+  }
+  if (el.batchClearSectionBtn) {
+    el.batchClearSectionBtn.addEventListener("click", () => setCurrentBatchSectionChecked(false));
+  }
+  if (el.batchClearAllStagedBtn) {
+    el.batchClearAllStagedBtn.addEventListener("click", () => {
+      if (confirm("Clear all staged batch parameters across all sections?")) {
+        resetAllStagedBatchParams();
+      }
+    });
+  }
+  if (el.batchCancelRunBtn) {
+    el.batchCancelRunBtn.addEventListener("click", () => {
+      state.batch.cancelRequested = true;
+      el.batchCancelRunBtn.disabled = true;
+      el.batchCancelRunBtn.textContent = "Stopping after current node...";
+    });
+  }
+  if (el.batchForceApplyBtn) {
+    el.batchForceApplyBtn.addEventListener("click", async () => {
+      if (state.batch.running) return;
+      const changes = buildStagedBatchChanges();
+      if (!changes.length) {
+        showToast("Check at least one parameter to force-apply.", "err");
+        return;
+      }
+      const ordered = getOrderedBatchNodes();
+      if (!ordered.length) {
+        showToast("Select at least one node first.", "err");
+        return;
+      }
+      const blind = Boolean(el.batchBlindOverwriteCb?.checked);
+      const { totalParams, totalSections } = getStagedCounts();
+      const blindNote = blind
+        ? "\n\nBLIND OVERWRITE is enabled: unchecked fields in those sections will be reset to defaults on target nodes."
+        : "";
+      if (
+        !confirm(
+          `Force-push ${totalParams} parameter(s) across ${totalSections} section(s) to ${ordered.length} selected node(s)?${blindNote}`
+        )
+      ) {
+        return;
+      }
+      await runBatchExecution({
+        label: `Force Push (${totalParams} param${totalParams === 1 ? "" : "s"})`,
+        changes,
+        blindOverwrite: blind,
+      });
+    });
+  }
+
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       if (!el.usbModal.classList.contains("hidden")) {
         el.usbModal.classList.add("hidden");
       } else if (!el.traceModal.classList.contains("hidden")) {
         el.traceModal.classList.add("hidden");
+      } else if (state.batch.open && !state.batch.running) {
+        closeBatchModal();
       } else if (state.modal.open) {
         closeConfigModal();
       }

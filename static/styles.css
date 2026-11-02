@@ -1245,6 +1245,163 @@ code, .mono-id {
   font-size: 0.85rem;
 }
 
+/* Batch Selection & Multi-Node Force Editor */
+.batch-trigger-btn {
+  margin-left: 6px;
+}
+
+.col-check {
+  width: 38px;
+  text-align: center !important;
+  padding-left: 10px !important;
+  padding-right: 4px !important;
+}
+
+.batch-row-cb {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.nodes-table tr.batch-selected td {
+  background: rgba(56, 189, 248, 0.06);
+}
+
+.batch-targets-strip {
+  padding: 9px 18px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(11, 17, 27, 0.55);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  max-height: 78px;
+  overflow-y: auto;
+}
+
+.batch-target-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  font-size: 0.75rem;
+}
+
+.nav-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 19px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--gold-bg);
+  border: 1px solid var(--gold-border);
+  color: var(--gold);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.field-card.batch-dimmed {
+  opacity: 0.62;
+  transition: opacity 0.14s ease, border-color 0.14s ease, background 0.14s ease;
+}
+
+.field-card.batch-forced {
+  opacity: 1;
+  border-color: var(--gold-border);
+  background: linear-gradient(180deg, rgba(251, 191, 36, 0.06), rgba(11, 17, 27, 0.55));
+}
+
+.batch-force-check-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed rgba(148, 163, 184, 0.18);
+}
+
+.batch-force-check-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--gold);
+  cursor: pointer;
+  user-select: none;
+}
+
+.field-card.batch-dimmed .batch-force-check-label {
+  color: var(--text-muted);
+}
+
+.batch-apply-footer {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.batch-progress-panel {
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(11, 17, 27, 0.72);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+}
+
+.batch-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 0.84rem;
+}
+
+.batch-progress-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 175px;
+  overflow-y: auto;
+}
+
+.batch-progress-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+
+.batch-progress-row.ok {
+  border-color: rgba(52, 211, 153, 0.45);
+}
+
+.batch-progress-row.err {
+  border-color: rgba(248, 113, 113, 0.5);
+  color: #fecaca;
+}
+
+.batch-progress-row.running {
+  border-color: var(--accent);
+}
+
 /* Toasts */
 .toast-container {
   position: fixed;
