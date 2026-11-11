@@ -115,8 +115,10 @@
     batchClearSectionBtn: document.getElementById("batch-clear-section-btn"),
     batchClearAllStagedBtn: document.getElementById("batch-clear-all-staged-btn"),
     batchSectionWarning: document.getElementById("batch-section-warning"),
+    batchLoopUntilSuccessCb: document.getElementById("batch-loop-until-success-cb"),
     batchProgressPanel: document.getElementById("batch-progress-panel"),
     batchProgressTitle: document.getElementById("batch-progress-title"),
+    batchRetryFailedBtn: document.getElementById("batch-retry-failed-btn"),
     batchCancelRunBtn: document.getElementById("batch-cancel-run-btn"),
     batchProgressList: document.getElementById("batch-progress-list"),
     batchFormContainer: document.getElementById("batch-form-container"),
@@ -1941,23 +1943,47 @@
     return changes;
   }
 
-  async function runBatchExecution({ label, action = null, params = {}, changes = null, blindOverwrite = false }) {
-    const ordered = getOrderedBatchNodes();
+  function sleepInterruptible(ms) {
+    return new Promise((resolve) => {
+      const end = Date.now() + ms;
+      const tick = () => {
+        if (state.batch.cancelRequested || Date.now() >= end) {
+          resolve();
+        } else {
+          setTimeout(tick, 180);
+        }
+      };
+      tick();
+    });
+  }
+
+  async function runBatchExecution({
+    label,
+    action = null,
+    params = {},
+    changes = null,
+    blindOverwrite = false,
+    subsetNodes = null,
+  }) {
+    const ordered = subsetNodes && subsetNodes.length ? subsetNodes : getOrderedBatchNodes();
     if (!ordered.length) {
       showToast("No nodes selected for batch operation.", "err");
       return;
     }
 
+    state.batch.lastRunSpec = { label, action, params, changes, blindOverwrite };
     state.batch.running = true;
     state.batch.cancelRequested = false;
+    state.batch.skippedNodeIds = new Set();
     renderBatchTargetsStrip();
     updateBatchStagedSummaryUI();
 
     el.batchProgressPanel.classList.remove("hidden");
+    if (el.batchRetryFailedBtn) el.batchRetryFailedBtn.classList.add("hidden");
     el.batchCancelRunBtn.classList.remove("hidden");
     el.batchCancelRunBtn.disabled = false;
-    el.batchCancelRunBtn.textContent = "Stop Remaining";
-    el.batchProgressTitle.textContent = `${label} — 0 / ${ordered.length} completed...`;
+    el.batchCancelRunBtn.textContent = "Stop Loop";
+    el.batchProgressTitle.textContent = `${label} — Pass #1 starting (0 / ${ordered.length} succeeded)...`;
 
     el.batchProgressList.innerHTML = ordered
       .map(
@@ -1966,76 +1992,187 @@
           <span>
             <strong>${escapeHtml(n.long_name || n.node_id)}</strong>
             <code>${escapeHtml(n.node_id)}</code>
-            ${n.is_admin_node ? `<span class="eyebrow-badge">LOCAL</span>` : ""}
+            ${n.is_admin_node ? `<span class="eyebrow-badge">LOCAL · LAST</span>` : ""}
           </span>
-          <span class="js-prog-status muted-sm">Queued</span>
+          <span style="display:flex; align-items:center; gap:8px;">
+            <span class="js-prog-status muted-sm">Queued</span>
+            <button type="button" class="btn btn-ghost btn-xs js-batch-skip-node" data-node-id="${escapeHtml(n.node_id)}" title="Skip retrying this node">
+              Skip
+            </button>
+          </span>
         </div>`
       )
       .join("");
 
-    let succeeded = 0;
-    let failed = 0;
-    let processed = 0;
+    el.batchProgressList.querySelectorAll(".js-batch-skip-node").forEach((btn) => {
+      btn.onclick = () => {
+        const nid = btn.dataset.nodeId;
+        state.batch.skippedNodeIds.add(nid);
+        btn.classList.add("hidden");
+        const row = el.batchProgressList.querySelector(`[data-prog-node="${CSS.escape(nid)}"]`);
+        const stEl = row?.querySelector(".js-prog-status");
+        if (row && !row.classList.contains("ok")) {
+          row.classList.remove("retrying");
+          if (!row.classList.contains("running")) {
+            if (stEl) stEl.textContent = "Skipped by user";
+          } else if (stEl) {
+            stEl.textContent += " (will not retry)";
+          }
+        }
+      };
+    });
 
-    for (const node of ordered) {
-      const row = el.batchProgressList.querySelector(`[data-prog-node="${CSS.escape(node.node_id)}"]`);
-      const stEl = row?.querySelector(".js-prog-status");
+    const succeededIds = new Set();
+    const attemptsById = {};
+    const lastErrorById = {};
 
-      if (state.batch.cancelRequested) {
-        if (stEl) stEl.textContent = "Stopped / Skipped";
-        continue;
+    const remotePeers = ordered.filter((n) => !n.is_admin_node);
+    const localPeers = ordered.filter((n) => n.is_admin_node);
+
+    const executeGroupUntilDone = async (groupNodes) => {
+      let pending = [...groupNodes];
+      let passNum = 0;
+
+      while (pending.length > 0 && !state.batch.cancelRequested) {
+        passNum += 1;
+        const nextPending = [];
+
+        for (const node of pending) {
+          const nid = node.node_id;
+          const row = el.batchProgressList.querySelector(`[data-prog-node="${CSS.escape(nid)}"]`);
+          const stEl = row?.querySelector(".js-prog-status");
+          const skipBtn = row?.querySelector(".js-batch-skip-node");
+
+          if (state.batch.cancelRequested) {
+            if (stEl && !succeededIds.has(nid)) {
+              stEl.textContent = lastErrorById[nid]
+                ? `Stopped after ${attemptsById[nid] || 1} attempt(s): ${lastErrorById[nid]}`
+                : "Stopped before send";
+            }
+            if (skipBtn) skipBtn.classList.add("hidden");
+            continue;
+          }
+
+          if (state.batch.skippedNodeIds.has(nid)) {
+            if (row) row.classList.remove("running", "retrying");
+            if (stEl) stEl.textContent = "Skipped by user";
+            if (skipBtn) skipBtn.classList.add("hidden");
+            continue;
+          }
+
+          const attemptNo = (attemptsById[nid] || 0) + 1;
+          attemptsById[nid] = attemptNo;
+
+          if (row) {
+            row.classList.remove("err", "retrying");
+            row.classList.add("running");
+          }
+          if (stEl) {
+            stEl.className = "js-prog-status";
+            stEl.textContent =
+              attemptNo === 1
+                ? "Transmitting over LoRa..."
+                : `Attempt #${attemptNo} (Pass #${passNum}) — Transmitting over LoRa...`;
+          }
+          el.batchProgressTitle.textContent = `${label} — Pass #${passNum} · Sending to ${node.long_name || nid} (Attempt #${attemptNo}, ${succeededIds.size}/${ordered.length} succeeded)...`;
+
+          try {
+            const body = action
+              ? { action, params }
+              : { changes, blind_overwrite: Boolean(blindOverwrite) };
+            const res = await apiJson(`/api/node/${encodeURIComponent(nid)}/batch`, {
+              method: "POST",
+              body: JSON.stringify(body),
+            });
+            succeededIds.add(nid);
+            delete lastErrorById[nid];
+            if (row) {
+              row.classList.remove("running", "retrying", "err");
+              row.classList.add("ok");
+            }
+            if (skipBtn) skipBtn.classList.add("hidden");
+            if (stEl) {
+              const appliedList = res.applied_sections || res.result?.applied_sections || [];
+              const baseTxt = appliedList.length
+                ? `✓ Saved (${appliedList.join(", ")})`
+                : `✓ ${action} sent`;
+              stEl.textContent = attemptNo > 1 ? `${baseTxt} (on attempt #${attemptNo})` : baseTxt;
+            }
+          } catch (err) {
+            lastErrorById[nid] = err.message;
+            const shouldLoop =
+              Boolean(el.batchLoopUntilSuccessCb?.checked) &&
+              !state.batch.cancelRequested &&
+              !state.batch.skippedNodeIds.has(nid);
+
+            if (shouldLoop) {
+              nextPending.push(node);
+              if (row) {
+                row.classList.remove("running", "err");
+                row.classList.add("retrying");
+              }
+              if (stEl) {
+                stEl.textContent = `↻ Attempt #${attemptNo} (${err.message}) — queued for Pass #${passNum + 1}`;
+              }
+            } else {
+              if (row) {
+                row.classList.remove("running", "retrying");
+                row.classList.add("err");
+              }
+              if (skipBtn) skipBtn.classList.add("hidden");
+              if (stEl) {
+                stEl.textContent = `✕ ${err.message}${attemptNo > 1 ? ` (${attemptNo} attempts)` : ""}`;
+              }
+            }
+          }
+        }
+
+        // Filter out any nodes the user clicked 'Skip' on while an HTTP call was in flight
+        pending = nextPending.filter((n) => !state.batch.skippedNodeIds.has(n.node_id));
+
+        if (pending.length > 0 && !state.batch.cancelRequested && Boolean(el.batchLoopUntilSuccessCb?.checked)) {
+          el.batchProgressTitle.textContent = `${label} — Pass #${passNum} complete (${succeededIds.size}/${ordered.length} succeeded). Waiting 2.5s for LoRa airwaves to clear before Pass #${passNum + 1} (${pending.length} remaining)...`;
+          await sleepInterruptible(2500);
+        } else {
+          break;
+        }
       }
+    };
 
-      if (row) row.classList.add("running");
-      if (stEl) {
-        stEl.className = "js-prog-status";
-        stEl.textContent = "Transmitting over LoRa...";
-      }
+    // 1. Run and loop all remote mesh peers until they succeed (or are skipped/stopped)
+    await executeGroupUntilDone(remotePeers);
 
-      try {
-        const body = action
-          ? { action, params }
-          : { changes, blind_overwrite: Boolean(blindOverwrite) };
-        const res = await apiJson(`/api/node/${encodeURIComponent(node.node_id)}/batch`, {
-          method: "POST",
-          body: JSON.stringify(body),
-        });
-        succeeded += 1;
-        if (row) {
-          row.classList.remove("running");
-          row.classList.add("ok");
-        }
-        if (stEl) {
-          const appliedList = res.applied_sections || res.result?.applied_sections || [];
-          const appliedTxt = appliedList.length
-            ? `✓ Saved (${appliedList.join(", ")})`
-            : `✓ ${action} sent`;
-          stEl.textContent = appliedTxt;
-        }
-      } catch (err) {
-        failed += 1;
-        if (row) {
-          row.classList.remove("running");
-          row.classList.add("err");
-        }
-        if (stEl) {
-          stEl.textContent = `✕ ${err.message}`;
-        }
-      }
-
-      processed += 1;
-      el.batchProgressTitle.textContent = `${label} — ${processed} / ${ordered.length} processed (${succeeded} ok, ${failed} failed)`;
+    // 2. Only after remote peers finish, execute the local paired Admin Node (if selected and not stopped)
+    if (!state.batch.cancelRequested && localPeers.length > 0) {
+      await executeGroupUntilDone(localPeers);
     }
 
+    // Clean up any leftover Skip buttons
+    el.batchProgressList.querySelectorAll(".js-batch-skip-node").forEach((b) => b.classList.add("hidden"));
+
+    const remainingNodes = ordered.filter((n) => !succeededIds.has(n.node_id));
+    state.batch.failedNodes = remainingNodes;
     state.batch.running = false;
     el.batchCancelRunBtn.classList.add("hidden");
+
+    if (el.batchRetryFailedBtn) {
+      if (remainingNodes.length > 0) {
+        el.batchRetryFailedBtn.textContent = `Retry Remaining (${remainingNodes.length})`;
+        el.batchRetryFailedBtn.classList.remove("hidden");
+      } else {
+        el.batchRetryFailedBtn.classList.add("hidden");
+      }
+    }
+
     renderBatchTargetsStrip();
     updateBatchStagedSummaryUI();
 
-    const stoppedNote = state.batch.cancelRequested ? " (stopped early)" : "";
-    el.batchProgressTitle.textContent = `${label} finished${stoppedNote}: ${succeeded} succeeded, ${failed} failed.`;
+    const stoppedNote = state.batch.cancelRequested ? " (stopped)" : "";
+    const succeeded = succeededIds.size;
+    const failed = remainingNodes.length;
+    el.batchProgressTitle.textContent = `${label} finished${stoppedNote}: ${succeeded}/${ordered.length} succeeded${failed ? `, ${failed} incomplete` : ""}.`;
     showToast(
-      `${label}: ${succeeded}/${ordered.length} succeeded${failed ? ` (${failed} failed)` : ""}`,
+      `${label}: ${succeeded}/${ordered.length} succeeded${failed ? ` (${failed} incomplete)` : ""}`,
       failed > 0 && succeeded === 0 ? "err" : "ok"
     );
     await refreshState();
@@ -2536,7 +2673,16 @@
     el.batchCancelRunBtn.addEventListener("click", () => {
       state.batch.cancelRequested = true;
       el.batchCancelRunBtn.disabled = true;
-      el.batchCancelRunBtn.textContent = "Stopping after current node...";
+      el.batchCancelRunBtn.textContent = "Stopping after current packet...";
+    });
+  }
+  if (el.batchRetryFailedBtn) {
+    el.batchRetryFailedBtn.addEventListener("click", async () => {
+      if (state.batch.running || !state.batch.lastRunSpec || !state.batch.failedNodes?.length) return;
+      await runBatchExecution({
+        ...state.batch.lastRunSpec,
+        subsetNodes: state.batch.failedNodes,
+      });
     });
   }
   if (el.batchForceApplyBtn) {

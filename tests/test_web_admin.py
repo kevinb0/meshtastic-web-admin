@@ -640,6 +640,34 @@ class MeshtasticWebAdminTests(unittest.TestCase):
         self.assertEqual(blind_lora.hop_limit, 4)
         self.assertEqual(blind_lora.region, config_pb2.Config.LoRaConfig.RegionCode.UNSET)
 
+        # 4. Retry loop on transient timeout: RELAY_NUM fails twice with TimeoutError then succeeds on attempt #3,
+        #    while ADMIN_NUM waits until RELAY_NUM succeeds!
+        call_counts = {relay_id: 0, admin_id: 0}
+        orig_apply = self.manager.apply_batch_to_node
+
+        def _flaky_apply(nid: str, **kwargs):
+            call_counts[nid] = call_counts.get(nid, 0) + 1
+            if nid == relay_id and call_counts[nid] <= 2:
+                raise TimeoutError(f"Timed out after 12s waiting for response from {nid}")
+            return orig_apply(nid, **kwargs)
+
+        with mock.patch.object(self.manager, "apply_batch_to_node", side_effect=_flaky_apply):
+            retry_res = self.client.post(
+                "/api/batch",
+                json={
+                    "node_ids": [admin_id, relay_id],
+                    "action": "reboot",
+                    "max_attempts": 4,
+                    "retry_delay": 0.01,
+                },
+            ).get_json()
+        self.assertTrue(retry_res["ok"])
+        self.assertEqual(retry_res["succeeded"], 2)
+        self.assertEqual(retry_res["failed"], 0)
+        by_nid = {r["node_id"]: r for r in retry_res["results"]}
+        self.assertEqual(by_nid[relay_id]["attempts"], 3)
+        self.assertEqual(by_nid[admin_id]["attempts"], 1)
+
     def test_global_python_auto_reexec_into_venv(self) -> None:
         proc = subprocess.run(
             ["python", str(ROOT / "app.py"), "--help"],

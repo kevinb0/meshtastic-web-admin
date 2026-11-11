@@ -239,6 +239,8 @@ def create_app(manager: Optional[MeshAdminManager] = None) -> Flask:
         params = body.get("params") if isinstance(body.get("params"), dict) else None
         changes = body.get("changes") if isinstance(body.get("changes"), list) else None
         blind_overwrite = bool(body.get("blind_overwrite", False))
+        max_attempts = int(body.get("max_attempts", 1) or 1)
+        retry_delay = float(body.get("retry_delay", 1.5))
         try:
             summary = mesh.apply_batch(
                 node_ids=node_ids,
@@ -246,6 +248,8 @@ def create_app(manager: Optional[MeshAdminManager] = None) -> Flask:
                 params=params,
                 changes=changes,
                 blind_overwrite=blind_overwrite,
+                max_attempts=max_attempts,
+                retry_delay=retry_delay,
             )
             return jsonify({"ok": True, **summary})
         except Exception as exc:

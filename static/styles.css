@@ -1353,6 +1353,14 @@ code, .mono-id {
   gap: 12px;
 }
 
+.batch-loop-bar {
+  margin: 10px 0 12px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(251, 191, 36, 0.08);
+  border: 1px solid rgba(251, 191, 36, 0.28);
+}
+
 .batch-progress-panel {
   margin-bottom: 14px;
   padding: 12px 14px;
@@ -1400,6 +1408,11 @@ code, .mono-id {
 
 .batch-progress-row.running {
   border-color: var(--accent);
+}
+
+.batch-progress-row.retrying {
+  border-color: rgba(251, 191, 36, 0.55);
+  color: var(--gold);
 }
 
 /* Toasts */

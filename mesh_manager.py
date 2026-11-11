@@ -640,12 +640,13 @@ class MeshAdminManager:
         try:
             req = admin_pb2.AdminMessage()
             req.get_owner_request = True
-            resp_pkt = self._send_admin_and_wait(
-                node_num=node_num,
-                admin_msg=req,
-                want_data_response=True,
-                timeout=timeout,
-            )
+            with self._admin_op_lock:
+                resp_pkt = self._send_admin_and_wait(
+                    node_num=node_num,
+                    admin_msg=req,
+                    want_data_response=True,
+                    timeout=timeout,
+                )
             adm_raw = resp_pkt.get("decoded", {}).get("admin", {}).get("raw")
             if adm_raw is not None and adm_raw.HasField("get_owner_response"):
                 self._mark_admin_verified(node_num, adm_raw.session_passkey or None)
@@ -1194,6 +1195,15 @@ class MeshAdminManager:
         if routing is not None:
             err = routing.get("errorReason", "NONE")
             if err != "NONE":
+                if err in ("TIMEOUT", "MAX_RETRANSMIT", "NO_RESPONSE", "DUTY_CYCLE_LIMIT", "NO_CHANNEL"):
+                    raise TimeoutError(
+                        f"LoRa delivery timed out ({err}) communicating with {format_node_id(node_num)}"
+                    )
+                if err in ("UNAUTHORIZED", "PKI_FAILED", "PKI_UNKNOWN_PUBKEY", "BAD_REQUEST"):
+                    with self._lock:
+                        entry = self._ensure_live_entry(node_num)
+                        entry["session_passkey"] = None
+                        entry["passkey_ts"] = 0.0
                 raise PermissionError(
                     f"Node {format_node_id(node_num)} rejected or failed admin request: {err}"
                 )
@@ -1205,7 +1215,7 @@ class MeshAdminManager:
 
         return pkt
 
-    def _ensure_fresh_session_passkey(self, node_num: int, timeout: float = 12.0) -> bytes:
+    def _ensure_fresh_session_passkey(self, node_num: int, timeout: float = 15.0) -> bytes:
         """Ensure we hold a fresh Meshtastic 2.5+ ``session_passkey`` (< 240s old) before writing."""
         with self._lock:
             entry = self._ensure_live_entry(node_num)
@@ -1749,13 +1759,13 @@ class MeshAdminManager:
 
                 sub_pb = getattr(wrapper, section)
                 if not blind_overwrite:
-                    try:
-                        current_dict = self.get_config_section(canonical_id, kind, section, refresh=False)
-                        apply_dict_to_protobuf(sub_pb, current_dict)
-                        if kind == "config" and section == "security" and current_dict.get("public_key"):
+                    current_dict = self.get_config_section(canonical_id, kind, section, refresh=False)
+                    apply_dict_to_protobuf(sub_pb, current_dict)
+                    if kind == "config" and section == "security" and current_dict.get("public_key"):
+                        try:
                             sub_pb.public_key = base64.b64decode(current_dict["public_key"])
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
                 elif kind == "config" and section == "security":
                     # Even in blind mode, preserve known public_key from NodeDB if present
                     with self._lock:
@@ -1777,11 +1787,8 @@ class MeshAdminManager:
                 ch_pb = channel_pb2.Channel()
                 ch_pb.index = index
                 if not blind_overwrite:
-                    try:
-                        existing = self.get_channel(canonical_id, index, refresh=False)
-                        apply_dict_to_channel(ch_pb, existing, index)
-                    except Exception:
-                        ch_pb.index = index
+                    existing = self.get_channel(canonical_id, index, refresh=False)
+                    apply_dict_to_channel(ch_pb, existing, index)
                 apply_dict_to_channel(ch_pb, values, index)
                 if index == 0 and ch_pb.role == channel_pb2.Channel.Role.DISABLED:
                     ch_pb.role = channel_pb2.Channel.Role.PRIMARY
@@ -1890,13 +1897,17 @@ class MeshAdminManager:
         params: Optional[Dict[str, Any]] = None,
         changes: Optional[List[Dict[str, Any]]] = None,
         blind_overwrite: bool = False,
+        max_attempts: int = 1,
+        retry_delay: float = 1.5,
     ) -> Dict[str, Any]:
         """Execute a batch action or multi-parameter push across multiple nodes sequentially,
-        automatically ordering remote peers before the paired local Admin Node."""
+        automatically ordering remote peers before the paired local Admin Node and optionally
+        retrying timed-out remote nodes across up to ``max_attempts`` passes."""
         cleaned_ids = [str(nid).strip() for nid in (node_ids or []) if str(nid).strip()]
         if not cleaned_ids:
             raise ValueError("Select at least one node for batch operation.")
 
+        max_passes = max(1, int(max_attempts or 1))
         admin_num = self._get_admin_node_num()
         admin_id = format_node_id(admin_num) if admin_num is not None else None
 
@@ -1930,21 +1941,76 @@ class MeshAdminManager:
                     elif psk_raw == "random128":
                         chg["values"]["psk_text"] = "base64:" + base64.b64encode(secrets.token_bytes(16)).decode("ascii")
 
-        results: List[Dict[str, Any]] = []
-        succeeded = 0
-        for nid in ordered_ids:
+        results_by_id: Dict[str, Dict[str, Any]] = {}
+        pending_remote = list(remote_ids)
+        pass_num = 0
+
+        while pending_remote and pass_num < max_passes:
+            pass_num += 1
+            if pass_num > 1 and retry_delay > 0:
+                time.sleep(retry_delay)
+            next_pending: List[str] = []
+            for nid in pending_remote:
+                prev_attempts = int((results_by_id.get(nid) or {}).get("attempts") or 0)
+                attempt_no = prev_attempts + 1
+                try:
+                    res = self.apply_batch_to_node(
+                        nid,
+                        action=action,
+                        params=params,
+                        changes=resolved_changes,
+                        blind_overwrite=blind_overwrite,
+                    )
+                    results_by_id[nid] = {
+                        "node_id": nid,
+                        "ok": True,
+                        "attempts": attempt_no,
+                        "result": res,
+                    }
+                except TimeoutError as exc:
+                    results_by_id[nid] = {
+                        "node_id": nid,
+                        "ok": False,
+                        "attempts": attempt_no,
+                        "error": str(exc),
+                    }
+                    if pass_num < max_passes:
+                        next_pending.append(nid)
+                except Exception as exc:
+                    results_by_id[nid] = {
+                        "node_id": nid,
+                        "ok": False,
+                        "attempts": attempt_no,
+                        "error": str(exc),
+                    }
+            pending_remote = next_pending
+
+        # Execute local Admin Node LAST after all remote passes finish
+        if include_local and admin_id:
             try:
                 res = self.apply_batch_to_node(
-                    nid,
+                    admin_id,
                     action=action,
                     params=params,
                     changes=resolved_changes,
                     blind_overwrite=blind_overwrite,
                 )
-                results.append({"node_id": nid, "ok": True, "result": res})
-                succeeded += 1
+                results_by_id[admin_id] = {
+                    "node_id": admin_id,
+                    "ok": True,
+                    "attempts": 1,
+                    "result": res,
+                }
             except Exception as exc:
-                results.append({"node_id": nid, "ok": False, "error": str(exc)})
+                results_by_id[admin_id] = {
+                    "node_id": admin_id,
+                    "ok": False,
+                    "attempts": 1,
+                    "error": str(exc),
+                }
+
+        results = [results_by_id[nid] for nid in ordered_ids if nid in results_by_id]
+        succeeded = sum(1 for r in results if r.get("ok"))
 
         return {
             "total": len(ordered_ids),
