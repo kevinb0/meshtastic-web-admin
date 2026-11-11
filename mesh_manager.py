@@ -901,6 +901,8 @@ class MeshAdminManager:
                     "public_key": u.get("publicKey") or "",
                     "long_name": long_name,
                     "short_name": short_name,
+                    "is_licensed": bool(owner_cache.get("is_licensed", u.get("isLicensed", False))),
+                    "is_unmessagable": bool(owner_cache.get("is_unmessagable", u.get("isUnmessagable", False))),
                     "hw_model": u.get("hwModel") or "UNSET",
                     "role": u.get("role") or "CLIENT",
                     "channel": int(nd.get("channel") or 0),
@@ -1294,8 +1296,15 @@ class MeshAdminManager:
         if not short_name:
             raise ValueError("Short Name cannot be empty.")
 
-        is_licensed = bool(values.get("is_licensed", False))
-        is_unmessagable = bool(values.get("is_unmessagable", False))
+        with self._lock:
+            live_entry = self._ensure_live_entry(node_num)
+            oc = live_entry.get("owner_cache") or {}
+            nd_user = ((self._iface.nodesByNum or {}).get(node_num) or {}).get("user") or {} if self._iface else {}
+            default_licensed = bool(oc.get("is_licensed", nd_user.get("isLicensed", False)))
+            default_unmessagable = bool(oc.get("is_unmessagable", nd_user.get("isUnmessagable", False)))
+
+        is_licensed = bool(values["is_licensed"]) if "is_licensed" in values else default_licensed
+        is_unmessagable = bool(values["is_unmessagable"]) if "is_unmessagable" in values else default_unmessagable
 
         with self._admin_op_lock:
             passkey = self._ensure_fresh_session_passkey(node_num)
@@ -1793,6 +1802,8 @@ class MeshAdminManager:
                 if index == 0 and ch_pb.role == channel_pb2.Channel.Role.DISABLED:
                     ch_pb.role = channel_pb2.Channel.Role.PRIMARY
                 prepared_steps.append(("channel", (index, ch_pb), values))
+            elif kind == "owner":
+                prepared_steps.append(("owner", None, values))
             else:
                 raise ValueError(f"Unsupported batch change kind '{kind}'")
 
@@ -1875,6 +1886,10 @@ class MeshAdminManager:
                         if is_local and self._iface and self._iface.localNode and self._iface.localNode.channels:
                             self._iface.localNode.channels[index].CopyFrom(ch_pb)
                     applied_sections.append(f"channel.{index}")
+
+                elif kind == "owner":
+                    self.set_owner(canonical_id, values)
+                    applied_sections.append("owner")
 
             commit_msg = admin_pb2.AdminMessage()
             if passkey:

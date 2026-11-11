@@ -27,6 +27,17 @@
       running: false,
       cancelRequested: false,
     },
+    bulkRename: {
+      open: false,
+      scope: "admin", // 'selected' | 'admin' | 'all'
+      search: "",
+      drafts: {}, // { [nodeId]: { long_name, short_name, is_unmessagable, is_licensed, statusText, statusKind } }
+      checkedIds: new Set(),
+      skippedIds: new Set(),
+      failedIds: [],
+      running: false,
+      cancelRequested: false,
+    },
   };
 
   // DOM Elements
@@ -56,6 +67,7 @@
     kpiRelayed: document.getElementById("kpi-relayed"),
     openBatchBtn: document.getElementById("open-batch-btn"),
     batchSelCount: document.getElementById("batch-sel-count"),
+    openBulkRenameBtn: document.getElementById("open-bulk-rename-btn"),
     clearBatchSelBtn: document.getElementById("clear-batch-sel-btn"),
     selectAllNodesCb: document.getElementById("select-all-nodes-cb"),
     nodeSortBy: document.getElementById("node-sort-by"),
@@ -126,6 +138,27 @@
     batchBlindOverwriteCb: document.getElementById("batch-blind-overwrite-cb"),
     batchStagedSummary: document.getElementById("batch-staged-summary"),
     batchForceApplyBtn: document.getElementById("batch-force-apply-btn"),
+    // Bulk Rename modal
+    bulkRenameModal: document.getElementById("bulk-rename-modal"),
+    bulkRenameCloseBtn: document.getElementById("bulk-rename-close-btn"),
+    bulkRenameCountBadge: document.getElementById("bulk-rename-count-badge"),
+    bulkRenameSearch: document.getElementById("bulk-rename-search"),
+    bulkCheckModifiedBtn: document.getElementById("bulk-check-modified-btn"),
+    bulkResetEditsBtn: document.getElementById("bulk-reset-edits-btn"),
+    bulkPatternLong: document.getElementById("bulk-pattern-long"),
+    bulkPatternShort: document.getElementById("bulk-pattern-short"),
+    bulkPatternStart: document.getElementById("bulk-pattern-start"),
+    bulkApplyPatternBtn: document.getElementById("bulk-apply-pattern-btn"),
+    bulkAutoShortBtn: document.getElementById("bulk-auto-short-btn"),
+    bulkRenameProgressBar: document.getElementById("bulk-rename-progress-bar"),
+    bulkRenameProgressTitle: document.getElementById("bulk-rename-progress-title"),
+    bulkRenameRetryBtn: document.getElementById("bulk-rename-retry-btn"),
+    bulkRenameStopBtn: document.getElementById("bulk-rename-stop-btn"),
+    bulkRenameSelectAllCb: document.getElementById("bulk-rename-select-all-cb"),
+    bulkRenameTbody: document.getElementById("bulk-rename-tbody"),
+    bulkRenameLoopCb: document.getElementById("bulk-rename-loop-cb"),
+    bulkRenameSummary: document.getElementById("bulk-rename-summary"),
+    bulkRenamePushBtn: document.getElementById("bulk-rename-push-btn"),
     toastContainer: document.getElementById("toast-container"),
   };
 
@@ -1670,6 +1703,13 @@
   function renderBatchActionsPane() {
     el.batchFormContainer.innerHTML = `
       <div class="actions-grid">
+        <div class="action-box" style="border-color: rgba(251, 191, 36, 0.4);">
+          <div>
+            <h4>Bulk Rename Nodes</h4>
+            <p class="muted-sm">Open the side-by-side Bulk Rename table to customize Long Names &amp; 4-character Short Names across multiple nodes at once.</p>
+          </div>
+          <button type="button" class="btn btn-primary btn-sm" id="batch-open-bulk-rename-btn">Open Bulk Rename Table</button>
+        </div>
         <div class="action-box" style="border-color: rgba(248, 113, 113, 0.35);">
           <div>
             <h4>Turn Off / Shutdown Selected Nodes</h4>
@@ -1706,6 +1746,15 @@
           <button type="button" class="btn btn-danger btn-sm" data-batch-act="reset_nodedb">Reset NodeDB</button>
         </div>
       </div>`;
+
+    const openRenameBtn = document.getElementById("batch-open-bulk-rename-btn");
+    if (openRenameBtn) {
+      openRenameBtn.onclick = () => {
+        if (state.batch.running) return;
+        closeBatchModal();
+        openBulkRenameModal("selected");
+      };
+    }
 
     el.batchFormContainer.querySelectorAll("[data-batch-act]").forEach((btn) => {
       btn.onclick = async () => {
@@ -2176,6 +2225,648 @@
       failed > 0 && succeeded === 0 ? "err" : "ok"
     );
     await refreshState();
+  }
+
+  // ------------------------------------------------------------------
+  // Dedicated Bulk Rename Multi-Node Page / Modal
+  // ------------------------------------------------------------------
+  function ensureBulkDraft(node) {
+    const existing = state.bulkRename.drafts[node.node_id];
+    if (existing) return existing;
+    const draft = {
+      long_name: String(node.long_name || ""),
+      short_name: String(node.short_name || "").slice(0, 4),
+      is_unmessagable: Boolean(node.is_unmessagable),
+      is_licensed: Boolean(node.is_licensed),
+      statusText: "",
+      statusKind: "", // '' | 'ok' | 'retrying' | 'err' | 'running'
+    };
+    state.bulkRename.drafts[node.node_id] = draft;
+    return draft;
+  }
+
+  function isBulkDraftModified(node, draft) {
+    if (!node || !draft) return false;
+    return (
+      draft.long_name.trim() !== String(node.long_name || "").trim() ||
+      draft.short_name.trim() !== String(node.short_name || "").trim() ||
+      Boolean(draft.is_unmessagable) !== Boolean(node.is_unmessagable) ||
+      Boolean(draft.is_licensed) !== Boolean(node.is_licensed)
+    );
+  }
+
+  function getBulkRenameVisibleNodes() {
+    const allNodes = state.snapshot?.nodes || [];
+    const scope = state.bulkRename.scope;
+    const q = (state.bulkRename.search || "").trim().toLowerCase();
+
+    return allNodes.filter((n) => {
+      if (scope === "selected" && !state.batch.selectedNodeIds.has(n.node_id)) return false;
+      if (scope === "admin" && !n.has_admin) return false;
+      if (!q) return true;
+      const draft = state.bulkRename.drafts[n.node_id];
+      const hay = `${n.long_name} ${n.short_name} ${n.node_id} ${n.hw_model} ${n.role} ${draft?.long_name || ""} ${draft?.short_name || ""}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }
+
+  function openBulkRenameModal(preferredScope = null) {
+    if (!state.snapshot?.connection?.paired) {
+      showToast("Pair to an Admin Node first.", "err");
+      return;
+    }
+
+    const allNodes = state.snapshot?.nodes || [];
+    for (const n of allNodes) {
+      ensureBulkDraft(n);
+    }
+
+    if (preferredScope) {
+      state.bulkRename.scope = preferredScope;
+    } else if (state.batch.selectedNodeIds.size > 0) {
+      state.bulkRename.scope = "selected";
+      for (const id of state.batch.selectedNodeIds) {
+        state.bulkRename.checkedIds.add(id);
+      }
+    } else {
+      const hasAdminNodes = allNodes.some((n) => n.has_admin);
+      state.bulkRename.scope = hasAdminNodes ? "admin" : "all";
+    }
+
+    state.bulkRename.open = true;
+    syncBulkScopeButtonsUI();
+    renderBulkRenameTable();
+    el.bulkRenameModal.classList.remove("hidden");
+  }
+
+  function closeBulkRenameModal() {
+    if (state.bulkRename.running) {
+      showToast("Bulk rename is currently running — click 'Stop Loop' first.", "err");
+      return;
+    }
+    state.bulkRename.open = false;
+    el.bulkRenameModal.classList.add("hidden");
+  }
+
+  function syncBulkScopeButtonsUI() {
+    const allNodes = state.snapshot?.nodes || [];
+    const selCount = state.batch.selectedNodeIds.size;
+    const admCount = allNodes.filter((n) => n.has_admin).length;
+
+    document.querySelectorAll(".js-bulk-scope").forEach((btn) => {
+      const sc = btn.dataset.scope;
+      btn.classList.toggle("active", sc === state.bulkRename.scope);
+      if (sc === "selected") {
+        btn.textContent = `Checked in Main Table (${selCount})`;
+      } else if (sc === "admin") {
+        btn.textContent = `Admin Controllable (${admCount})`;
+      } else if (sc === "all") {
+        btn.textContent = `All Mesh Nodes (${allNodes.length})`;
+      }
+    });
+  }
+
+  function syncBulkRenameFooterUI() {
+    const visible = getBulkRenameVisibleNodes();
+    const checkedCount = state.bulkRename.checkedIds.size;
+    const allNodesById = new Map((state.snapshot?.nodes || []).map((n) => [n.node_id, n]));
+    let modifiedChecked = 0;
+    for (const id of state.bulkRename.checkedIds) {
+      const n = allNodesById.get(id);
+      const d = state.bulkRename.drafts[id];
+      if (n && d && isBulkDraftModified(n, d)) {
+        modifiedChecked += 1;
+      }
+    }
+
+    if (el.bulkRenameCountBadge) {
+      el.bulkRenameCountBadge.textContent = `${checkedCount} queued`;
+    }
+    if (el.bulkRenameSummary) {
+      el.bulkRenameSummary.textContent =
+        checkedCount === 0
+          ? "0 nodes checked (edit any row or check rows to rename)"
+          : `${checkedCount} node${checkedCount === 1 ? "" : "s"} checked (${modifiedChecked} modified)`;
+    }
+    if (el.bulkRenamePushBtn) {
+      el.bulkRenamePushBtn.disabled = state.bulkRename.running || checkedCount === 0;
+      el.bulkRenamePushBtn.textContent =
+        checkedCount > 0 ? `Push New Names (${checkedCount})` : "Push New Names";
+    }
+
+    if (el.bulkRenameSelectAllCb) {
+      if (!visible.length) {
+        el.bulkRenameSelectAllCb.checked = false;
+        el.bulkRenameSelectAllCb.indeterminate = false;
+        el.bulkRenameSelectAllCb.disabled = true;
+      } else {
+        const visChecked = visible.filter((n) => state.bulkRename.checkedIds.has(n.node_id)).length;
+        el.bulkRenameSelectAllCb.disabled = state.bulkRename.running;
+        el.bulkRenameSelectAllCb.checked = visChecked === visible.length;
+        el.bulkRenameSelectAllCb.indeterminate = visChecked > 0 && visChecked < visible.length;
+      }
+    }
+  }
+
+  function renderBulkRenameTable() {
+    syncBulkScopeButtonsUI();
+    const visible = getBulkRenameVisibleNodes();
+
+    if (!visible.length) {
+      el.bulkRenameTbody.innerHTML = `
+        <tr>
+          <td colspan="7" style="text-align:center; padding:28px; color:var(--text-muted);">
+            No nodes in this scope. Switch to <strong>Admin Controllable</strong> or <strong>All Mesh Nodes</strong> above.
+          </td>
+        </tr>`;
+      syncBulkRenameFooterUI();
+      return;
+    }
+
+    el.bulkRenameTbody.innerHTML = visible
+      .map((n) => {
+        const d = ensureBulkDraft(n);
+        const isChecked = state.bulkRename.checkedIds.has(n.node_id);
+        const isMod = isBulkDraftModified(n, d);
+        const rowCls = [
+          d.statusKind === "ok"
+            ? "bulk-row-ok"
+            : d.statusKind === "retrying"
+            ? "bulk-row-retrying"
+            : d.statusKind === "err"
+            ? "bulk-row-err"
+            : isMod
+            ? "bulk-row-modified"
+            : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+        const accessBadge = n.is_admin_node
+          ? `<span class="route-badge local">LOCAL ADMIN</span>`
+          : n.has_admin
+          ? `<span class="route-badge direct">ADMIN</span>`
+          : `<span class="route-badge unknown" title="Admin Power not yet verified">UNVERIFIED</span>`;
+
+        const statusDefault = isMod
+          ? `<span style="color:var(--gold); font-weight:600;">&#9998; Modified</span>`
+          : `<span class="muted-sm">Unchanged</span>`;
+        const statusHtml = d.statusText ? escapeHtml(d.statusText) : statusDefault;
+
+        return `
+          <tr class="${rowCls}" data-bulk-row="${escapeHtml(n.node_id)}">
+            <td class="col-check">
+              <input
+                type="checkbox"
+                class="batch-row-cb js-bulk-row-cb"
+                data-node-id="${escapeHtml(n.node_id)}"
+                ${isChecked ? "checked" : ""}
+                ${state.bulkRename.running ? "disabled" : ""}
+              />
+            </td>
+            <td>
+              <div class="node-cell-title">
+                <code>${escapeHtml(n.node_id)}</code>
+                ${accessBadge}
+              </div>
+              <div class="node-cell-sub">
+                <span>${escapeHtml(n.hw_model || "UNKNOWN")}</span>
+                <span>Role: ${escapeHtml(n.role || "CLIENT")}</span>
+              </div>
+            </td>
+            <td>
+              <div class="node-cell-title">
+                <strong>${escapeHtml(n.long_name)}</strong>
+                <span class="short-pill">${escapeHtml(n.short_name)}</span>
+              </div>
+            </td>
+            <td>
+              <input
+                type="text"
+                class="field-input js-bulk-long-input"
+                data-node-id="${escapeHtml(n.node_id)}"
+                maxlength="39"
+                value="${escapeHtml(d.long_name)}"
+                placeholder="Long Name (1–39 chars)"
+                ${state.bulkRename.running ? "disabled" : ""}
+              />
+            </td>
+            <td>
+              <input
+                type="text"
+                class="field-input mono-id js-bulk-short-input"
+                data-node-id="${escapeHtml(n.node_id)}"
+                maxlength="4"
+                value="${escapeHtml(d.short_name)}"
+                placeholder="4ch"
+                ${state.bulkRename.running ? "disabled" : ""}
+              />
+            </td>
+            <td>
+              <div style="display:flex; flex-direction:column; gap:3px; font-size:0.76rem;">
+                <label style="display:flex; align-items:center; gap:5px; cursor:pointer;" title="Mark node as unmessagable (infrastructure / sensor)">
+                  <input type="checkbox" class="js-bulk-unmsg-cb" data-node-id="${escapeHtml(n.node_id)}" ${d.is_unmessagable ? "checked" : ""} ${state.bulkRename.running ? "disabled" : ""} />
+                  <span>Unmessagable</span>
+                </label>
+                <label style="display:flex; align-items:center; gap:5px; cursor:pointer;" title="Licensed Amateur Radio (HAM) operator mode">
+                  <input type="checkbox" class="js-bulk-ham-cb" data-node-id="${escapeHtml(n.node_id)}" ${d.is_licensed ? "checked" : ""} ${state.bulkRename.running ? "disabled" : ""} />
+                  <span>HAM Licensed</span>
+                </label>
+              </div>
+            </td>
+            <td>
+              <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
+                <span class="js-bulk-row-status" style="font-size:0.8rem;">${statusHtml}</span>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-xs js-bulk-skip-btn ${state.bulkRename.running && isChecked && d.statusKind !== "ok" ? "" : "hidden"}"
+                  data-node-id="${escapeHtml(n.node_id)}"
+                >
+                  Skip
+                </button>
+              </div>
+            </td>
+          </tr>`;
+      })
+      .join("");
+
+    syncBulkRenameFooterUI();
+  }
+
+  function updateSingleBulkRowVisual(nodeId) {
+    const node = (state.snapshot?.nodes || []).find((n) => n.node_id === nodeId);
+    const draft = state.bulkRename.drafts[nodeId];
+    if (!node || !draft) return;
+
+    const tr = el.bulkRenameTbody.querySelector(`tr[data-bulk-row="${CSS.escape(nodeId)}"]`);
+    if (!tr) return;
+
+    const isMod = isBulkDraftModified(node, draft);
+    if (isMod) {
+      state.bulkRename.checkedIds.add(nodeId);
+      const cb = tr.querySelector(".js-bulk-row-cb");
+      if (cb) cb.checked = true;
+    }
+
+    draft.statusText = "";
+    draft.statusKind = "";
+    tr.classList.remove("bulk-row-ok", "bulk-row-retrying", "bulk-row-err");
+    tr.classList.toggle("bulk-row-modified", isMod);
+
+    const stEl = tr.querySelector(".js-bulk-row-status");
+    if (stEl) {
+      stEl.innerHTML = isMod
+        ? `<span style="color:var(--gold); font-weight:600;">&#9998; Modified</span>`
+        : `<span class="muted-sm">Unchanged</span>`;
+    }
+    syncBulkRenameFooterUI();
+  }
+
+  function deriveFourCharShortName(longName, fallbackId = "") {
+    const cleaned = String(longName || "").trim();
+    if (!cleaned) return String(fallbackId || "").replace(/^!/, "").slice(-4).toUpperCase() || "NODE";
+
+    const words = cleaned.split(/[\s\-_]+/).filter(Boolean);
+    if (words.length === 1) {
+      return words[0].replace(/[^A-Za-z0-9]/g, "").slice(0, 4).toUpperCase() || cleaned.slice(0, 4).toUpperCase();
+    }
+
+    // Extract trailing number if present (e.g. "Squad 6" -> "SQ6", "Squad 12" -> "SQ12", "Alpha Relay 2" -> "AR2")
+    const lastWord = words[words.length - 1];
+    if (/^\d+$/.test(lastWord)) {
+      const numStr = lastWord.slice(-2);
+      const prefixWords = words.slice(0, -1);
+      const avail = Math.max(1, 4 - numStr.length);
+      let prefix = "";
+      if (prefixWords.length === 1) {
+        prefix = prefixWords[0].replace(/[^A-Za-z0-9]/g, "").slice(0, avail);
+      } else {
+        prefix = prefixWords.map((w) => w[0] || "").join("").slice(0, avail);
+      }
+      return (prefix + numStr).toUpperCase().slice(0, 4);
+    }
+
+    const initials = words.map((w) => w[0] || "").join("");
+    if (initials.length >= 2) {
+      const extra = words[0].slice(1, 1 + Math.max(0, 4 - initials.length));
+      return (words[0][0] + extra + initials.slice(1)).toUpperCase().slice(0, 4);
+    }
+    return cleaned.replace(/\s+/g, "").slice(0, 4).toUpperCase();
+  }
+
+  function applyBulkRenamePattern() {
+    if (state.bulkRename.running) return;
+    const longPat = (el.bulkPatternLong?.value || "").trim();
+    const shortPat = (el.bulkPatternShort?.value || "").trim();
+    const startNum = parseInt(el.bulkPatternStart?.value || "1", 10) || 1;
+
+    if (!longPat && !shortPat) {
+      showToast("Enter a Long Name Pattern or Short Name Pattern first (e.g. 'Squad {n}' and 'SQ{n}').", "err");
+      return;
+    }
+
+    const visible = getBulkRenameVisibleNodes();
+    if (!visible.length) return;
+
+    // Apply to checked visible rows, or if none are checked yet, apply to all visible rows (excluding local Admin Node unless explicitly checked)
+    let targets = visible.filter((n) => state.bulkRename.checkedIds.has(n.node_id));
+    if (!targets.length) {
+      const remoteVis = visible.filter((n) => !n.is_admin_node);
+      targets = remoteVis.length ? remoteVis : visible;
+    }
+
+    targets.forEach((node, idx) => {
+      const num = startNum + idx;
+      const zeroNum = String(num).padStart(2, "0");
+      const id4 = String(node.node_id || "").replace(/^!/, "").slice(-4);
+      const curLong = String(node.long_name || "");
+      const curShort = String(node.short_name || "");
+
+      const draft = ensureBulkDraft(node);
+      if (longPat) {
+        const expandedLong = longPat
+          .replace(/\{0n\}/gi, zeroNum)
+          .replace(/\{n\}/gi, String(num))
+          .replace(/\{id4\}/gi, id4)
+          .replace(/\{current\}/gi, curLong)
+          .slice(0, 39);
+        draft.long_name = expandedLong;
+      }
+
+      if (shortPat) {
+        const expandedShort = shortPat
+          .replace(/\{0n\}/gi, zeroNum)
+          .replace(/\{n\}/gi, String(num))
+          .replace(/\{id4\}/gi, id4)
+          .replace(/\{current\}/gi, curShort)
+          .slice(0, 4);
+        draft.short_name = expandedShort;
+      } else if (longPat) {
+        draft.short_name = deriveFourCharShortName(draft.long_name, node.node_id);
+      }
+
+      draft.statusText = "";
+      draft.statusKind = "";
+      state.bulkRename.checkedIds.add(node.node_id);
+    });
+
+    renderBulkRenameTable();
+    showToast(`Filled pattern across ${targets.length} node(s) — review and click Push New Names!`);
+  }
+
+  function autoGenerateBulkShortNames() {
+    if (state.bulkRename.running) return;
+    const visible = getBulkRenameVisibleNodes();
+    let targets = visible.filter((n) => state.bulkRename.checkedIds.has(n.node_id));
+    if (!targets.length) targets = visible;
+
+    targets.forEach((node) => {
+      const draft = ensureBulkDraft(node);
+      draft.short_name = deriveFourCharShortName(draft.long_name, node.node_id);
+      if (isBulkDraftModified(node, draft)) {
+        state.bulkRename.checkedIds.add(node.node_id);
+      }
+    });
+    renderBulkRenameTable();
+    showToast(`Generated 4-character Short Names for ${targets.length} row(s)`);
+  }
+
+  function resetBulkRenameEdits() {
+    if (state.bulkRename.running) return;
+    state.bulkRename.drafts = {};
+    state.bulkRename.checkedIds.clear();
+    for (const n of state.snapshot?.nodes || []) {
+      ensureBulkDraft(n);
+    }
+    renderBulkRenameTable();
+  }
+
+  function sleepBulkInterruptible(ms) {
+    return new Promise((resolve) => {
+      const end = Date.now() + ms;
+      const tick = () => {
+        if (state.bulkRename.cancelRequested || Date.now() >= end) {
+          resolve();
+        } else {
+          setTimeout(tick, 180);
+        }
+      };
+      tick();
+    });
+  }
+
+  async function runBulkRenamePush(subsetNodeIds = null) {
+    if (state.bulkRename.running) return;
+    const allNodes = state.snapshot?.nodes || [];
+    const nodesById = new Map(allNodes.map((n) => [n.node_id, n]));
+
+    const candidateIds = subsetNodeIds && subsetNodeIds.length
+      ? subsetNodeIds
+      : [...state.bulkRename.checkedIds];
+
+    if (!candidateIds.length) {
+      showToast("Check or edit at least one node row first.", "err");
+      return;
+    }
+
+    // Validate non-empty Long Name & Short Name on all target rows before starting
+    for (const nid of candidateIds) {
+      const node = nodesById.get(nid) || { node_id: nid, long_name: nid, short_name: nid.slice(-4) };
+      const draft = ensureBulkDraft(node);
+      if (!draft.long_name.trim()) {
+        showToast(`Long Name cannot be empty on ${nid}`, "err");
+        return;
+      }
+      if (!draft.short_name.trim()) {
+        showToast(`Short Name cannot be empty on ${nid}`, "err");
+        return;
+      }
+    }
+
+    // Order remote peers first, local paired Admin Node last
+    const remoteTargets = [];
+    const localTargets = [];
+    for (const nid of candidateIds) {
+      const node = nodesById.get(nid) || { node_id: nid, long_name: nid, short_name: nid.slice(-4), is_admin_node: false };
+      if (node.is_admin_node) {
+        localTargets.push(node);
+      } else {
+        remoteTargets.push(node);
+      }
+    }
+    const orderedTargets = [...remoteTargets, ...localTargets];
+
+    state.bulkRename.running = true;
+    state.bulkRename.cancelRequested = false;
+    state.bulkRename.skippedIds = new Set();
+    state.bulkRename.failedIds = [];
+
+    el.bulkRenameProgressBar.classList.remove("hidden");
+    el.bulkRenameRetryBtn.classList.add("hidden");
+    el.bulkRenameStopBtn.classList.remove("hidden");
+    el.bulkRenameStopBtn.disabled = false;
+    el.bulkRenameStopBtn.textContent = "Stop Loop";
+
+    for (const t of orderedTargets) {
+      const d = ensureBulkDraft(t);
+      d.statusText = "Queued";
+      d.statusKind = "";
+    }
+    renderBulkRenameTable();
+
+    const succeededIds = new Set();
+    const attemptsById = {};
+    const lastErrorById = {};
+
+    const setRowStatusLive = (nid, text, kind, showSkip = false) => {
+      const d = state.bulkRename.drafts[nid];
+      if (d) {
+        d.statusText = text;
+        d.statusKind = kind;
+      }
+      const tr = el.bulkRenameTbody.querySelector(`tr[data-bulk-row="${CSS.escape(nid)}"]`);
+      if (!tr) return;
+      tr.classList.remove("bulk-row-modified", "bulk-row-ok", "bulk-row-retrying", "bulk-row-err");
+      if (kind === "ok") tr.classList.add("bulk-row-ok");
+      else if (kind === "retrying") tr.classList.add("bulk-row-retrying");
+      else if (kind === "err") tr.classList.add("bulk-row-err");
+
+      const stEl = tr.querySelector(".js-bulk-row-status");
+      if (stEl) stEl.textContent = text;
+      const skipBtn = tr.querySelector(".js-bulk-skip-btn");
+      if (skipBtn) skipBtn.classList.toggle("hidden", !showSkip);
+    };
+
+    const runGroupLoop = async (groupNodes) => {
+      let pending = [...groupNodes];
+      let passNum = 0;
+
+      while (pending.length > 0 && !state.bulkRename.cancelRequested) {
+        passNum += 1;
+        const nextPending = [];
+
+        for (const node of pending) {
+          const nid = node.node_id;
+          if (state.bulkRename.cancelRequested) {
+            if (!succeededIds.has(nid)) {
+              setRowStatusLive(
+                nid,
+                lastErrorById[nid] ? `Stopped (${lastErrorById[nid]})` : "Stopped",
+                "err",
+                false
+              );
+            }
+            continue;
+          }
+
+          if (state.bulkRename.skippedIds.has(nid)) {
+            setRowStatusLive(nid, "Skipped by user", "", false);
+            continue;
+          }
+
+          const attemptNo = (attemptsById[nid] || 0) + 1;
+          attemptsById[nid] = attemptNo;
+          const draft = ensureBulkDraft(node);
+          const payloadValues = {
+            long_name: draft.long_name.trim().slice(0, 39),
+            short_name: draft.short_name.trim().slice(0, 4),
+            is_unmessagable: Boolean(draft.is_unmessagable),
+            is_licensed: Boolean(draft.is_licensed),
+          };
+
+          setRowStatusLive(
+            nid,
+            attemptNo === 1
+              ? `Transmitting "${payloadValues.long_name}"...`
+              : `Attempt #${attemptNo} (Pass #${passNum}): Transmitting...`,
+            "running",
+            true
+          );
+          el.bulkRenameProgressTitle.textContent = `Pass #${passNum} — Renaming ${nid} to "${payloadValues.long_name}" [${payloadValues.short_name}] (Attempt #${attemptNo}, ${succeededIds.size}/${orderedTargets.length} succeeded)...`;
+
+          try {
+            await apiJson(`/api/node/${encodeURIComponent(nid)}/owner`, {
+              method: "POST",
+              body: JSON.stringify({ values: payloadValues }),
+            });
+            succeededIds.add(nid);
+            delete lastErrorById[nid];
+            state.bulkRename.checkedIds.delete(nid);
+            // Update local snapshot node entry immediately so Current Name column reflects the new name
+            node.long_name = payloadValues.long_name;
+            node.short_name = payloadValues.short_name;
+            node.is_unmessagable = payloadValues.is_unmessagable;
+            node.is_licensed = payloadValues.is_licensed;
+
+            const suffix = attemptNo > 1 ? ` (attempt #${attemptNo})` : "";
+            setRowStatusLive(
+              nid,
+              `✓ Renamed to "${payloadValues.long_name}" [${payloadValues.short_name}]${suffix}`,
+              "ok",
+              false
+            );
+          } catch (err) {
+            lastErrorById[nid] = err.message;
+            const shouldLoop =
+              Boolean(el.bulkRenameLoopCb?.checked) &&
+              !state.bulkRename.cancelRequested &&
+              !state.bulkRename.skippedIds.has(nid);
+
+            if (shouldLoop) {
+              nextPending.push(node);
+              setRowStatusLive(
+                nid,
+                `↻ Attempt #${attemptNo} (${err.message}) — queued for Pass #${passNum + 1}`,
+                "retrying",
+                true
+              );
+            } else {
+              setRowStatusLive(
+                nid,
+                `✕ ${err.message}${attemptNo > 1 ? ` (${attemptNo} attempts)` : ""}`,
+                "err",
+                false
+              );
+            }
+          }
+        }
+
+        pending = nextPending.filter((n) => !state.bulkRename.skippedIds.has(n.node_id));
+        if (pending.length > 0 && !state.bulkRename.cancelRequested && Boolean(el.bulkRenameLoopCb?.checked)) {
+          el.bulkRenameProgressTitle.textContent = `Pass #${passNum} complete (${succeededIds.size}/${orderedTargets.length} renamed). Waiting 2.5s for LoRa airwaves to clear before Pass #${passNum + 1} (${pending.length} remaining)...`;
+          await sleepBulkInterruptible(2500);
+        } else {
+          break;
+        }
+      }
+    };
+
+    await runGroupLoop(remoteTargets);
+    if (!state.bulkRename.cancelRequested && localTargets.length > 0) {
+      await runGroupLoop(localTargets);
+    }
+
+    const remainingIds = orderedTargets.map((n) => n.node_id).filter((id) => !succeededIds.has(id));
+    state.bulkRename.failedIds = remainingIds;
+    state.bulkRename.running = false;
+    el.bulkRenameStopBtn.classList.add("hidden");
+
+    if (remainingIds.length > 0) {
+      el.bulkRenameRetryBtn.textContent = `Retry Remaining (${remainingIds.length})`;
+      el.bulkRenameRetryBtn.classList.remove("hidden");
+    } else {
+      el.bulkRenameRetryBtn.classList.add("hidden");
+    }
+
+    const stoppedTxt = state.bulkRename.cancelRequested ? " (stopped)" : "";
+    el.bulkRenameProgressTitle.textContent = `Bulk Rename finished${stoppedTxt}: ${succeededIds.size}/${orderedTargets.length} renamed${remainingIds.length ? `, ${remainingIds.length} incomplete` : ""}.`;
+    showToast(
+      `Bulk Rename: ${succeededIds.size}/${orderedTargets.length} succeeded`,
+      remainingIds.length > 0 && succeededIds.size === 0 ? "err" : "ok"
+    );
+
+    await refreshState();
+    renderBulkRenameTable();
   }
 
   // ------------------------------------------------------------------
@@ -2718,12 +3409,169 @@
     });
   }
 
+  // Bulk Rename modal controls & delegated listeners
+  if (el.openBulkRenameBtn) {
+    el.openBulkRenameBtn.addEventListener("click", () => openBulkRenameModal(null));
+  }
+  if (el.bulkRenameCloseBtn) {
+    el.bulkRenameCloseBtn.addEventListener("click", closeBulkRenameModal);
+  }
+  if (el.bulkRenameModal) {
+    el.bulkRenameModal.addEventListener("click", (e) => {
+      if (e.target === el.bulkRenameModal) closeBulkRenameModal();
+    });
+  }
+  document.querySelectorAll(".js-bulk-scope").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (state.bulkRename.running) return;
+      state.bulkRename.scope = btn.dataset.scope;
+      renderBulkRenameTable();
+    });
+  });
+  if (el.bulkRenameSearch) {
+    el.bulkRenameSearch.addEventListener("input", () => {
+      state.bulkRename.search = el.bulkRenameSearch.value;
+      renderBulkRenameTable();
+    });
+  }
+  if (el.bulkCheckModifiedBtn) {
+    el.bulkCheckModifiedBtn.addEventListener("click", () => {
+      if (state.bulkRename.running) return;
+      state.bulkRename.checkedIds.clear();
+      const allNodesById = new Map((state.snapshot?.nodes || []).map((n) => [n.node_id, n]));
+      for (const [nid, draft] of Object.entries(state.bulkRename.drafts)) {
+        const node = allNodesById.get(nid);
+        if (node && isBulkDraftModified(node, draft)) {
+          state.bulkRename.checkedIds.add(nid);
+        }
+      }
+      renderBulkRenameTable();
+    });
+  }
+  if (el.bulkResetEditsBtn) {
+    el.bulkResetEditsBtn.addEventListener("click", () => {
+      if (state.bulkRename.running) return;
+      resetBulkRenameEdits();
+    });
+  }
+  if (el.bulkApplyPatternBtn) {
+    el.bulkApplyPatternBtn.addEventListener("click", applyBulkRenamePattern);
+  }
+  if (el.bulkAutoShortBtn) {
+    el.bulkAutoShortBtn.addEventListener("click", autoGenerateBulkShortNames);
+  }
+  if (el.bulkRenameSelectAllCb) {
+    el.bulkRenameSelectAllCb.addEventListener("change", () => {
+      if (state.bulkRename.running) return;
+      const check = el.bulkRenameSelectAllCb.checked;
+      for (const n of getBulkRenameVisibleNodes()) {
+        if (check) {
+          state.bulkRename.checkedIds.add(n.node_id);
+        } else {
+          state.bulkRename.checkedIds.delete(n.node_id);
+        }
+      }
+      renderBulkRenameTable();
+    });
+  }
+  if (el.bulkRenameTbody) {
+    el.bulkRenameTbody.addEventListener("input", (e) => {
+      const longInp = e.target.closest(".js-bulk-long-input");
+      if (longInp) {
+        const nid = longInp.dataset.nodeId;
+        const node = (state.snapshot?.nodes || []).find((n) => n.node_id === nid);
+        if (!node) return;
+        const draft = ensureBulkDraft(node);
+        draft.long_name = longInp.value;
+        updateSingleBulkRowVisual(nid);
+        return;
+      }
+
+      const shortInp = e.target.closest(".js-bulk-short-input");
+      if (shortInp) {
+        const nid = shortInp.dataset.nodeId;
+        const node = (state.snapshot?.nodes || []).find((n) => n.node_id === nid);
+        if (!node) return;
+        const draft = ensureBulkDraft(node);
+        draft.short_name = shortInp.value.slice(0, 4);
+        updateSingleBulkRowVisual(nid);
+      }
+    });
+
+    el.bulkRenameTbody.addEventListener("change", (e) => {
+      const rowCb = e.target.closest(".js-bulk-row-cb");
+      if (rowCb) {
+        const nid = rowCb.dataset.nodeId;
+        if (rowCb.checked) {
+          state.bulkRename.checkedIds.add(nid);
+        } else {
+          state.bulkRename.checkedIds.delete(nid);
+        }
+        syncBulkRenameFooterUI();
+        return;
+      }
+
+      const unmsgCb = e.target.closest(".js-bulk-unmsg-cb");
+      if (unmsgCb) {
+        const nid = unmsgCb.dataset.nodeId;
+        const node = (state.snapshot?.nodes || []).find((n) => n.node_id === nid);
+        if (!node) return;
+        const draft = ensureBulkDraft(node);
+        draft.is_unmessagable = unmsgCb.checked;
+        updateSingleBulkRowVisual(nid);
+        return;
+      }
+
+      const hamCb = e.target.closest(".js-bulk-ham-cb");
+      if (hamCb) {
+        const nid = hamCb.dataset.nodeId;
+        const node = (state.snapshot?.nodes || []).find((n) => n.node_id === nid);
+        if (!node) return;
+        const draft = ensureBulkDraft(node);
+        draft.is_licensed = hamCb.checked;
+        updateSingleBulkRowVisual(nid);
+      }
+    });
+
+    el.bulkRenameTbody.addEventListener("click", (e) => {
+      const skipBtn = e.target.closest(".js-bulk-skip-btn");
+      if (!skipBtn) return;
+      const nid = skipBtn.dataset.nodeId;
+      state.bulkRename.skippedIds.add(nid);
+      skipBtn.classList.add("hidden");
+      const tr = skipBtn.closest("tr");
+      const stEl = tr?.querySelector(".js-bulk-row-status");
+      if (stEl) stEl.textContent = "Skipping...";
+    });
+  }
+  if (el.bulkRenameStopBtn) {
+    el.bulkRenameStopBtn.addEventListener("click", () => {
+      state.bulkRename.cancelRequested = true;
+      el.bulkRenameStopBtn.disabled = true;
+      el.bulkRenameStopBtn.textContent = "Stopping after current packet...";
+    });
+  }
+  if (el.bulkRenameRetryBtn) {
+    el.bulkRenameRetryBtn.addEventListener("click", async () => {
+      if (state.bulkRename.running || !state.bulkRename.failedIds?.length) return;
+      await runBulkRenamePush(state.bulkRename.failedIds);
+    });
+  }
+  if (el.bulkRenamePushBtn) {
+    el.bulkRenamePushBtn.addEventListener("click", async () => {
+      if (state.bulkRename.running) return;
+      await runBulkRenamePush(null);
+    });
+  }
+
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       if (!el.usbModal.classList.contains("hidden")) {
         el.usbModal.classList.add("hidden");
       } else if (!el.traceModal.classList.contains("hidden")) {
         el.traceModal.classList.add("hidden");
+      } else if (state.bulkRename.open && !state.bulkRename.running) {
+        closeBulkRenameModal();
       } else if (state.batch.open && !state.batch.running) {
         closeBatchModal();
       } else if (state.modal.open) {

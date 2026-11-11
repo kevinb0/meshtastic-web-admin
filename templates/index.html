@@ -141,6 +141,14 @@
             Edit Selected Nodes (<span id="batch-sel-count">0</span>)
           </button>
           <button
+            id="open-bulk-rename-btn"
+            type="button"
+            class="btn btn-secondary btn-sm"
+            title="Open the Bulk Rename page to edit Long Name &amp; 4-char Short Name across multiple nodes on one screen"
+          >
+            Bulk Rename
+          </button>
+          <button
             id="clear-batch-sel-btn"
             type="button"
             class="btn btn-ghost btn-sm hidden"
@@ -427,6 +435,126 @@
             </div>
           </footer>
         </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- Dedicated Bulk Rename Multi-Node Page / Modal -->
+  <div id="bulk-rename-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="bulk-rename-title">
+    <div class="modal-window">
+      <header class="modal-header">
+        <div class="modal-title-group">
+          <span class="node-icon-btn admin-power static-badge" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 20h9" stroke-linecap="round"/>
+              <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <div>
+            <div class="modal-title-line">
+              <h2 id="bulk-rename-title">Bulk Rename Nodes</h2>
+              <span id="bulk-rename-count-badge" class="short-pill">0 queued</span>
+            </div>
+            <p class="muted-sm">
+              Edit Long Name (up to 39 chars) and Short Name (up to 4 chars) for all your nodes in one table — editing any row automatically selects it for push.
+            </p>
+          </div>
+        </div>
+        <button id="bulk-rename-close-btn" type="button" class="btn btn-ghost" aria-label="Close bulk rename modal">&times; Close</button>
+      </header>
+
+      <div class="bulk-rename-body">
+        <!-- Scope & Pattern Generator Toolbar -->
+        <div class="bulk-rename-toolbar">
+          <div class="bulk-scope-row">
+            <div class="filter-pills" role="tablist" aria-label="Bulk rename scope">
+              <button type="button" class="pill js-bulk-scope" data-scope="selected">Checked in Main Table</button>
+              <button type="button" class="pill js-bulk-scope active" data-scope="admin">Admin Controllable</button>
+              <button type="button" class="pill js-bulk-scope" data-scope="all">All Mesh Nodes</button>
+            </div>
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <input
+                id="bulk-rename-search"
+                class="search-input"
+                type="search"
+                placeholder="Filter nodes by name, !id, HW..."
+              />
+              <button id="bulk-check-modified-btn" type="button" class="btn btn-secondary btn-xs" title="Select only rows where New Name differs from Current Name">
+                Check Only Modified
+              </button>
+              <button id="bulk-reset-edits-btn" type="button" class="btn btn-ghost btn-xs" title="Revert all inputs back to current node names">
+                Reset Edits
+              </button>
+            </div>
+          </div>
+
+          <div class="bulk-pattern-bar">
+            <div class="bulk-pattern-field" style="flex:2; min-width:200px;">
+              <label class="field-label" for="bulk-pattern-long">Long Name Pattern <span class="muted-sm">(tokens: <code>{n}</code>, <code>{0n}</code>, <code>{id4}</code>, <code>{current}</code>)</span></label>
+              <input id="bulk-pattern-long" type="text" class="field-input" maxlength="39" placeholder="e.g. Squad {n}  or  Relay-{0n}" />
+            </div>
+            <div class="bulk-pattern-field" style="flex:1; min-width:140px;">
+              <label class="field-label" for="bulk-pattern-short">Short Name Pattern <span class="muted-sm">(max 4)</span></label>
+              <input id="bulk-pattern-short" type="text" class="field-input" maxlength="12" placeholder="e.g. SQ{n} or B{0n}" />
+            </div>
+            <div class="bulk-pattern-field" style="width:86px;">
+              <label class="field-label" for="bulk-pattern-start">Start #</label>
+              <input id="bulk-pattern-start" type="number" class="field-input" value="1" step="1" />
+            </div>
+            <div class="bulk-pattern-actions">
+              <button id="bulk-apply-pattern-btn" type="button" class="btn btn-secondary btn-sm" title="Fill pattern into checked rows (or all visible rows if none checked)">
+                Fill Pattern
+              </button>
+              <button id="bulk-auto-short-btn" type="button" class="btn btn-ghost btn-sm" title="Auto-generate 4-character Short Names from each row's New Long Name">
+                Auto 4-Char Shorts
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Live Execution Banner -->
+        <div id="bulk-rename-progress-bar" class="batch-progress-panel hidden" style="margin: 0 20px 10px;">
+          <div class="batch-progress-head" style="margin-bottom:0;">
+            <strong id="bulk-rename-progress-title">Renaming nodes over LoRa...</strong>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <button id="bulk-rename-retry-btn" type="button" class="btn btn-secondary btn-xs hidden">Retry Remaining</button>
+              <button id="bulk-rename-stop-btn" type="button" class="btn btn-danger btn-xs hidden">Stop Loop</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Editable Spreadsheet Table -->
+        <div class="bulk-table-scroll">
+          <table class="nodes-table bulk-rename-table">
+            <thead>
+              <tr>
+                <th class="col-check">
+                  <input id="bulk-rename-select-all-cb" type="checkbox" class="batch-row-cb" title="Check or uncheck all visible rows" />
+                </th>
+                <th>Node &amp; Link</th>
+                <th>Current Name</th>
+                <th style="min-width:230px;">New Long Name (max 39 chars)</th>
+                <th style="width:140px;">New Short (max 4)</th>
+                <th style="width:145px;">Options</th>
+                <th style="min-width:210px;">Status</th>
+              </tr>
+            </thead>
+            <tbody id="bulk-rename-tbody"></tbody>
+          </table>
+        </div>
+
+        <footer class="batch-apply-footer" style="margin-top:0; padding:12px 20px; background:var(--bg-elevated);">
+          <label class="flag-check" style="cursor:pointer;">
+            <input id="bulk-rename-loop-cb" type="checkbox" checked />
+            <span><strong>Loop &amp; retry timed-out nodes until all succeed</strong> <span class="muted-sm">(automatically re-queues `Timed out` nodes across passes)</span></span>
+          </label>
+          <div style="display:flex; align-items:center; gap:12px;">
+            <span id="bulk-rename-summary" class="muted-sm">0 nodes checked</span>
+            <button id="bulk-rename-push-btn" type="button" class="btn btn-primary" disabled>
+              Push New Names
+            </button>
+          </div>
+        </footer>
       </div>
     </div>
   </div>
